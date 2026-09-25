@@ -2599,8 +2599,8 @@ var eliteOfElites: seq[EliteArchiveEntry] = @[]
 const JEV_BRIDGE_PROTOCOL = 1
 const JEV_MAX_MODELS = 64
 const JEV_DEFAULT_MODELS = 64
-const JEV_GENERATION_INTERVAL = 25
-const JEV_STEPS = 4500
+const JEV_GENERATION_INTERVAL = 20
+const JEV_STEPS = 6400
 const JEV_SUFFIX_LENGTH = 64
 # Inner TEXT GA, independent for each outer Genome. Evaluations include the
 # initial population and every offspring; reusing an elite costs no evaluation.
@@ -2616,7 +2616,7 @@ static:
   doAssert JEV_INNER_CROSSOVER_PERCENT in 0..100
   doAssert JEV_INNER_IMMIGRANT_PERCENT in 0..100
 const JEV_SURVIVOR_SLOTS = 8
-const JEV_MA_WINDOW = 8
+const JEV_MA_WINDOW = 10
 
 const JEV_HALL_CAPACITY = 64
 const JEV_HALL_INJECT_SLOTS = 4
@@ -5564,8 +5564,8 @@ const ARCHIVE_MAX_ENTRIES = 2048
 # that are going to be rejected anyway.  v31 never falls back to the old
 # stride=2 (11 points/case) unless explicitly changed here; stride 3 already
 # gives about eight points on a 20-point trajectory and is materially cheaper.
-const FAST_EVAL_STRIDE = 8
-const FAST_EVAL_STRIDE_MIN = 4
+const FAST_EVAL_STRIDE = 7
+const FAST_EVAL_STRIDE_MIN = 5
 const FAST_EVAL_STRIDE_MAX = 10
 var adaptiveFastEvalStride = FAST_EVAL_STRIDE
 # FAST must not let computationally bloated offspring dominate generation time.
