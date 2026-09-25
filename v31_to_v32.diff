@@ -1,0 +1,290 @@
+--- /mnt/data/v31work/jev512_refined/at_jev.nim	2026-09-25 08:42:33.000000000 +0000
++++ /mnt/data/v32work/jev512_refined/at_jev.nim	2026-09-25 09:01:42.053603053 +0000
+@@ -27,6 +27,8 @@
+ #      slow-only stagnation epochs, matched crossover experiments, and exact
+ #      rolling scheduler state across checkpoint resume.
+ # v31: adaptive partial-case FAST screening, sparse audits/probes, cheaper hot path.
++# v32: sequential-race FAST screening: all optional offspring see 3 balanced cases;
++#      only progressively smaller contender pools see cases 4/5/6 before FULL.
+ # Audit: bounded parent pools, exact-duplicate rescue, cached distance minima.
+ # Build: nim c -d:release --threads:on at.nim
+ # Verify: ./at --regression-test && ./at --self-test
+@@ -5428,9 +5430,14 @@
+ const FAST_EVAL_STRIDE_MIN = 3
+ const FAST_EVAL_STRIDE_MAX = 4
+ var adaptiveFastEvalStride = FAST_EVAL_STRIDE
+-const FAST_CASE_COUNT_MIN = 3
+-const FAST_CASE_COUNT_MAX = 6
+-var adaptiveFastCaseCount = FAST_CASE_COUNT_MIN
++# Sequential race: every optional offspring first sees exactly one case from each
++# FAST/MEDIUM/SLOW timescale.  Only contenders receive the remaining cases.
++# The final race pool is >= FULL_EVAL_TOP_MAX, so every merit FULL candidate can
++# be screened on all six cases without paying six-case FAST cost for the tail.
++const FAST_RACE_BASE_CASES = 3
++const FAST_RACE_STAGE2_POOL = 128
++const FAST_RACE_STAGE3_POOL = 72
++const FAST_RACE_STAGE4_POOL = 48
+ const FAST_AUDIT_INTERVAL = 4
+ const FAST_AUDIT_COUNT_NORMAL = 4
+ const FAST_AUDIT_COUNT_RECOVERY = 8
+@@ -10347,7 +10354,7 @@
+   eliteOfElites.setLen(0)
+ 
+ echo "evaluation mode: parallel individual evaluation (--threads:on)"
+-echo "rolling evaluation: FULL=6 cases x 20 points; FAST starts with 3 rotating cases x ~8 points; exact temporal rounds"
++echo "rolling evaluation: FULL=6x20; FAST=v32 sequential race 3 cases for all -> +1 case on top 128/72/48; exact temporal rounds"
+ 
+ # stagnation判定は、32世代だけ保持されるslow rolling case上の改善で測る。
+ # case交換そのものを「悪化」扱いしないため、slow case交換直後はbaselineだけ張り直す。
+@@ -10574,13 +10581,17 @@
+   fastAggsX = phasedFast.x
+   fastAggsY = phasedFast.y
+   fastRankedY = buildRankedY(fastAggsY)
+-  let fastCaseIndices = selectFastCaseIndices(fastAggsX.len,
+-    adaptiveFastCaseCount, iter)
+-  let fastSubset = subsetFastEvalDataset(fastAggsX, fastAggsY,
+-    fastRankedY, fastCaseIndices)
+-  let screenAggsX = fastSubset.x
+-  let screenAggsY = fastSubset.y
+-  let screenRankedY = fastSubset.rankedY
++  # v32 race order: first 3 are balanced across the three rolling timescales;
++  # the remaining case IDs are the progressive race stages.  Each generation
++  # rotates which member of a timescale pair appears in the base panel.
++  let fastRaceCaseOrder = selectFastCaseIndices(fastAggsX.len, fastAggsX.len, iter)
++  let fastBaseCaseCount = min(FAST_RACE_BASE_CASES, fastRaceCaseOrder.len)
++  let fastBaseCaseIds = fastRaceCaseOrder[0 ..< fastBaseCaseCount]
++  let fastBaseSubset = subsetFastEvalDataset(fastAggsX, fastAggsY,
++    fastRankedY, fastBaseCaseIds)
++  let screenAggsX = fastBaseSubset.x
++  let screenAggsY = fastBaseSubset.y
++  let screenRankedY = fastBaseSubset.rankedY
+ 
+   if iter > 0 and iter mod CACHE_CLEAR_INTERVAL == 0:
+     # 100世代ごとの全消去は再コンパイルを大量発生させ、
+@@ -10679,31 +10690,103 @@
+   for jp in allIds:
+     if not fullSeen[jp]:
+       fastIds.add(jp)
+-  let screenedResults = parallelEvaluateCasesBatch(
+-    population,
+-    compiledPopulation,
+-    candidatePopulation,
+-    fastIds,
+-    unsafeAddr screenAggsX,
+-    unsafeAddr screenAggsY,
+-    unsafeAddr screenRankedY,
+-    AAA,
+-    FAST_EVAL_ROUNDS,
+-    "FAST"
+-  )
++  # ---------------- v32 sequential FAST race ----------------
++  # Stage 1 evaluates every optional offspring on only three balanced cases.
++  # Subsequent stages add ONE new case at a time to shrinking contender pools.
++  # Eliminated candidates are never re-evaluated, and their relative order is
++  # frozen at the stage where they lost.  Thus scores with different coverage
++  # are never compared across a race boundary.
+   var fastCaseScores = newSeq[seq[float]](pop_size)
+-  var fastScores = newSeq[float](fastIds.len)
++  var fastCaseSeen = newSeq[seq[bool]](pop_size)
++  let fastTotalCases = fastAggsX.len
++  for jp in fastIds:
++    fastCaseScores[jp] = newSeq[float](fastTotalCases)
++    fastCaseSeen[jp] = newSeq[bool](fastTotalCases)
++
++  proc fastObservedAggregate(id: int): float =
++    if id < 0 or id >= fastCaseScores.len or fastCaseScores[id].len == 0:
++      return -Inf
++    var total = 0.0
++    var weightSum = 0.0
++    for ci in 0 ..< min(fastCaseScores[id].len, fastCaseSeen[id].len):
++      if fastCaseSeen[id][ci]:
++        let w = rollingCaseBaseWeight(ci, fastTotalCases)
++        total += w * fastCaseScores[id][ci]
++        weightSum += w
++    if weightSum <= 0.0: -Inf else: total / weightSum
++
++  proc fastObservedCount(id: int): int =
++    if id < 0 or id >= fastCaseSeen.len: return 0
++    for seen in fastCaseSeen[id]:
++      if seen: inc result
++
++  proc orderFastIds(ids: openArray[int]): seq[int] =
++    if ids.len == 0: return @[]
++    var values = newSeq[float](ids.len)
++    for i, id in ids:
++      values[i] = fastObservedAggregate(id)
++    let localOrder = sortIndicesByScore(values)
++    result = newSeq[int](localOrder.len)
++    for i, pos in localOrder:
++      result[i] = ids[pos]
++
++  proc evaluateFastCaseFor(ids: seq[int], caseId: int, phaseName: string) =
++    if ids.len == 0 or caseId < 0 or caseId >= fastTotalCases: return
++    var oneX = @[fastAggsX[caseId]]
++    var oneY = @[fastAggsY[caseId]]
++    var oneRank = @[fastRankedY[caseId]]
++    let stageResults = parallelEvaluateCasesBatch(
++      population, compiledPopulation, candidatePopulation, ids,
++      addr oneX, addr oneY, addr oneRank, AAA, FAST_EVAL_ROUNDS, phaseName)
++    for i, id in ids:
++      if stageResults[i].len > 0:
++        fastCaseScores[id][caseId] = stageResults[i][0]
++        fastCaseSeen[id][caseId] = true
++
++  # Base panel is batched so each candidate is spawned only once for its three
++  # cases.  This preserves threadpool efficiency while cutting the tail early.
++  let baseResults = parallelEvaluateCasesBatch(
++    population, compiledPopulation, candidatePopulation, fastIds,
++    unsafeAddr screenAggsX, unsafeAddr screenAggsY, unsafeAddr screenRankedY,
++    AAA, FAST_EVAL_ROUNDS, "FAST_RACE_BASE")
+   for i, jp in fastIds:
+-    fastCaseScores[jp] = screenedResults[i]
+-    fastScores[i] = aggregateCaseScores(screenedResults[i])
+-    accs[jp] = fastScores[i]
++    for localCi, actualCi in fastBaseCaseIds:
++      if localCi < baseResults[i].len:
++        fastCaseScores[jp][actualCi] = baseResults[i][localCi]
++        fastCaseSeen[jp][actualCi] = true
++
++  var raceActive = orderFastIds(fastIds)
++  var raceEliminated: seq[seq[int]] = @[]
++  var raceStageSizes: seq[int] = @[raceActive.len]
++  var raceStageCases: seq[int] = @[]
++
++  # Cases 4/5/6 go only to progressively smaller pools.  The final pool is 48,
++  # matching FULL_EVAL_TOP_MAX, so every merit promotion is fully screened.
++  let racePoolTargets = [FAST_RACE_STAGE2_POOL, FAST_RACE_STAGE3_POOL,
++                         FAST_RACE_STAGE4_POOL]
++  for stage in 0 ..< min(3, max(0, fastRaceCaseOrder.len - fastBaseCaseCount)):
++    let keep = min(racePoolTargets[stage], raceActive.len)
++    if keep <= 0: break
++    if keep < raceActive.len:
++      raceEliminated.add(raceActive[keep ..< raceActive.len])
++      raceActive.setLen(keep)
++    let caseId = fastRaceCaseOrder[fastBaseCaseCount + stage]
++    raceStageCases.add(caseId)
++    evaluateFastCaseFor(raceActive, caseId, "FAST_RACE_" & $(stage + 2))
++    raceActive = orderFastIds(raceActive)
++    raceStageSizes.add(raceActive.len)
++
++  # Final race order: deepest survivors first, then reverse elimination layers.
++  # Within each layer all candidates were measured on identical cases.
++  var screeningOrder = raceActive
++  if raceEliminated.len > 0:
++    for layer in countdown(raceEliminated.high, 0):
++      screeningOrder.add(raceEliminated[layer])
+ 
+-  let tAfterFastEval = epochTime()
++  for jp in fastIds:
++    accs[jp] = fastObservedAggregate(jp)
+ 
+-  let screeningOrderLocal = sortIndicesByScore(fastScores)
+-  var screeningOrder = newSeq[int](screeningOrderLocal.len)
+-  for i, position in screeningOrderLocal:
+-    screeningOrder[i] = fastIds[position]
++  let tAfterFastEval = epochTime()
+   # Previously FULL_EVAL_TOP=42 included incumbents that were going to be FULL
+   # evaluated anyway. Preserve a similar total FULL budget but guarantee a
+   # useful number of distinct, screened newcomers in each generation.
+@@ -10742,10 +10825,13 @@
+   # Rescue case specialists hidden by mean-only screening. Their true FULL
+   # scores, never their FAST estimates, still determine survival and parenthood.
+   const SPECIALISTS_PER_CASE = 1
+-  for ci in 0 ..< screenAggsX.len:
++  # Specialist rescue uses only the three BASE cases because every optional
++  # candidate was measured on them.  Extra race cases would bias rescue toward
++  # candidates that had already survived an earlier stage.
++  for actualCi in fastBaseCaseIds:
+     var scores = newSeq[float](fastIds.len)
+     for i, jp in fastIds:
+-      scores[i] = fastCaseScores[jp][ci]
++      scores[i] = fastCaseScores[jp][actualCi]
+     let specialists = sortIndicesByScore(scores)
+     for oi in 0 ..< min(SPECIALISTS_PER_CASE, specialists.len):
+       let jp = fastIds[specialists[oi]]
+@@ -11052,12 +11138,10 @@
+       # Incumbents/probes were deliberately not FAST-evaluated. Compare
+       # only paired observations actually measured by both evaluators.
+       if id >= 0 and id < fastCaseScores.len and id < caseScores.len and
+-         fastCaseScores[id].len > 0 and caseScores[id].len > 0:
+-        # FAST may intentionally cover only one case from each timescale.
+-        # Correlation is therefore between the cheap partial objective and the
+-        # exact six-case FULL objective; that is precisely the screening error
+-        # we need to measure.
+-        fastValues.add(aggregateCaseScores(fastCaseScores[id]))
++         fastObservedCount(id) > 0 and caseScores[id].len > 0:
++        # Each candidate may stop at a different race depth. Compare its last
++        # actually-observed FAST objective with the exact six-case FULL score.
++        fastValues.add(fastObservedAggregate(id))
+         fullValues.add(aggregateCaseScores(caseScores[id]))
+     if fastValues.len < 4:
+       1.0
+@@ -11114,22 +11198,17 @@
+       screeningCorr = screeningCorrelation(fullIds)
+ 
+   # The independent audit is included in FULL-ranked selection and in the
+-  # paired FAST/FULL correlation above. v31 has two semantic-safe screening
+-  # cost knobs: number of cases and observations per case. Temporal execution
+-  # itself remains exact; poor screening restores coverage automatically.
++  # paired FAST/FULL correlation above. v32 uses a sequential case race plus a
++  # semantic-safe observation-stride knob. Temporal execution itself remains
++  # exact; poor screening restores denser observations automatically.
+   let previousFastStride = adaptiveFastEvalStride
+   let severeAuditMiss = auditMissedBest > 0 or auditMissedMerit >= 2 or
+     (auditMissedMerit > 0 and auditMaxMargin > FAST_AUDIT_SEVERE_MARGIN)
+ 
+-  # First spend/recover CASE coverage; it buys much more compute than shaving a
+-  # single trajectory point.  Always retain at least one case per timescale.
+-  if severeAuditMiss or screeningCorr < 0.68:
+-    adaptiveFastCaseCount = min(FAST_CASE_COUNT_MAX, adaptiveFastCaseCount + 2)
+-  elif screeningCorr < 0.80:
+-    adaptiveFastCaseCount = min(FAST_CASE_COUNT_MAX, adaptiveFastCaseCount + 1)
+-  elif screeningCorr > 0.92 and auditMissedMerit == 0:
+-    adaptiveFastCaseCount = max(FAST_CASE_COUNT_MIN, adaptiveFastCaseCount - 1)
+-
++  # Case coverage is now controlled structurally by the sequential race rather
++  # than by evaluating every candidate on an adaptive global case count.
++  # Reliability feedback therefore changes observation stride; independent
++  # audits still trigger denser sampling when the race becomes unsafe.
+   # Observation density is the secondary knob.  Never return to stride=2: on
+   # this 20-point objective it nearly doubles FAST work for little measured
+   # ranking benefit.  Only use stride=4 after very strong paired agreement.
+@@ -11150,17 +11229,33 @@
+   refreshAdaptiveLexicaseEpsilon(caseScores, fullIds)
+ 
+   var fastPointsSummary = "["
+-  for ci, xs in screenAggsX:
++  for ci, xs in fastAggsX:
+     if ci > 0: fastPointsSummary.add(",")
+     fastPointsSummary.add($xs.len)
+   fastPointsSummary.add("]")
++  var fastCandidateCaseEvals = fastIds.len * fastBaseCaseCount
++  var fastSampleEvals = 0
++  for caseId in fastBaseCaseIds:
++    if caseId >= 0 and caseId < fastAggsX.len:
++      fastSampleEvals += fastIds.len * fastAggsX[caseId].len
++  if raceStageSizes.len > 1:
++    for stage in 1 ..< raceStageSizes.len:
++      fastCandidateCaseEvals += raceStageSizes[stage]
++      let casePos = stage - 1
++      if casePos < raceStageCases.len:
++        let caseId = raceStageCases[casePos]
++        if caseId >= 0 and caseId < fastAggsX.len:
++          fastSampleEvals += raceStageSizes[stage] * fastAggsX[caseId].len
+   echo "  screening fast/full spearman=", formatFloat(screeningCorr, ffDecimal, 3),
+        " adaptive_extra=", adaptiveExtraIds.len,
+-       " fast_rounds=FULL,",
+-       " fast_cases_used=", fastCaseIndices,
+-       " fast_cases_next=", adaptiveFastCaseCount,
++       " fast_rounds=FULL, sequential_race=true",
++       " race_case_order=", fastRaceCaseOrder,
++       " race_stage_cases=", raceStageCases,
++       " race_stage_sizes=", raceStageSizes,
++       " fast_candidate_case_evals=", fastCandidateCaseEvals,
++       " fast_sample_evals=", fastSampleEvals,
+        " fast_stride_next=", adaptiveFastEvalStride,
+-       " fast_points_used=", fastPointsSummary,
++       " fast_points_per_case=", fastPointsSummary,
+        " audit_due=", auditDue,
+        " merit_full_target=", requestedFullTop,
+        " lex_eps=", adaptiveLexicaseEpsilon

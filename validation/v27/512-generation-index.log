@@ -1,0 +1,2 @@
+PASS: 128 dense/sparse candidate and exact-score equivalence cases
+candidate_scan_benchmark sparse_s=0.037687212 dense_s=0.02366033100000001 speedup=1.592843819471502

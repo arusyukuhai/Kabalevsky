@@ -1,0 +1,729 @@
+--- /tmp/tmp.o9DsxGjgol/jev512_refined/at_jev.nim	2026-09-25 16:06:38.000000000 +0000
++++ /mnt/data/jev_work/jev512_refined/at_jev.nim	2026-09-25 07:40:54.924664280 +0000
+@@ -16,6 +16,9 @@
+ # v25: 256-token permutation; adaptive fusion and v24 migration.
+ # v26/V11: four new capture filters.
+ # v27/V12: restored 512-token injection; exact aggregate fast paths.
++# v28: stabilize GP refinement: six 20-point cases, slower one-slot rolling,
++#      semantically exact FAST rounds, bounded local mutations, and wider
++#      crossover traces. The raw-byte diffusion domain is strictly 0..255.
+ # Audit: bounded parent pools, exact-duplicate rescue, cached distance minima.
+ # Build: nim c -d:release --threads:on at.nim
+ # Verify: ./at --regression-test && ./at --self-test
+@@ -1820,7 +1823,7 @@
+       if rand(99) < 70:
+         # 近傍値±小さな揺らぎ。ASCII/byte列の局所構造を壊しすぎない。
+         let delta = rand(5) - 2
+-        v = max(0, min(256, old + delta))
++        v = max(0, min(INPUT_BYTE_COUNT - 1, old + delta))
+       else:
+         v = randomDiffByte(old)
+       if v != old:
+@@ -1837,7 +1840,7 @@
+     for _ in 0 ..< k:
+       let old = state[pos]
+       let delta = rand(3) - 1
+-      let v = max(0, min(256, old + delta))
++      let v = max(0, min(INPUT_BYTE_COUNT - 1, old + delta))
+       if v != old:
+         state[pos] = v
+         inc changed
+@@ -1867,7 +1870,7 @@
+     let fromVal = state[rand(n - 1)]
+     var toVal = randomDiffByte(fromVal)
+     if toVal == fromVal:
+-      toVal = (fromVal + 1) mod 257
++      toVal = (fromVal + 1) mod INPUT_BYTE_COUNT
+     var changed = 0
+     for i in 0 ..< n:
+       if state[i] == fromVal:
+@@ -2159,8 +2162,13 @@
+   lo
+ 
+ proc sampleRuleLiteral(embedding: openArray[int]): int {.inline.} =
+-  ## Corpus byte frequency determines literals through the current permutation.
++  ## Most literals follow corpus byte frequency through the current injection,
++  ## but keep a small direct latent-token route. Without this, half of the
++  ## 512-token workspace can only be mentioned after another operator happens
++  ## to synthesize it, which makes latent-state building needlessly brittle.
+   if embedding.len == EMBEDDING_ENTRY_COUNT:
++    if rand(99) < 10:
++      return sampleEmbeddingDigit()
+     return embedding[sampleCorpusByte()]
+   sampleEmbeddingDigit()
+ 
+@@ -2173,13 +2181,13 @@
+ const NGRAM_SCAN_BYTE_BUDGET = 256_000  # 集計コストを抑えるための総スキャン量上限
+ 
+ # Multi-case / rolling-evaluation parameters.
+-# Three rolling cases: fast / medium / slow. Requested refresh widths are
+-# SLOW:MEDIUM:FAST = 2:3:11 generations. A deadline scheduler refreshes at most
+-# one group per generation, so the relatively dense 2/3 cadences do not collide.
+-# Each Spearman is computed within one trajectory, then aggregated.
+-const CASES_PER_TIMESCALE = 1
++# Six rolling cases: two fast / two medium / two slow trajectories.  Each
++# Spearman has 20 observations; this keeps the total evaluation set at 120
++# points while avoiding the very noisy tiny trajectories that arise when the
++# same budget is fragmented too aggressively.
++const CASES_PER_TIMESCALE = 2
+ const MULTI_CASE_COUNT = 3 * CASES_PER_TIMESCALE
+-const RETAINED_SAMPLES_PER_CASE = 40
++const RETAINED_SAMPLES_PER_CASE = 20
+ const FAST_ROLLING_SLOT = 0
+ const MEDIUM_ROLLING_SLOT = 1
+ const SLOW_ROLLING_SLOT = 2
+@@ -2483,7 +2491,10 @@
+     startPos: int       # original location, retained for interface-aware transfer
+ 
+ # 寄与診断の更新間隔。毎世代やると評価を余計に増やすため、数世代に1回だけ行う。
+-const CREDIT_REFRESH_INTERVAL = 64
++# Guided rule credit must track a rolling objective. 64 generations lets the
++# FAST/MEDIUM cases change many times before guidance catches up; refresh the
++# champion-side diagnostic often enough to remain relevant.
++const CREDIT_REFRESH_INTERVAL = 16
+ const MAX_GUIDED_MODULES = 16
+ const MODULE_MIN_LEN = 2
+ const MODULE_MAX_LEN = 32
+@@ -3151,10 +3162,13 @@
+       best = p
+   best
+ 
+-proc pickMutationTargets(g: Genome): seq[int] =
+-  ## ALL affected-rule counts use the same unrestricted logarithmic sampler.
++proc pickMutationTargets(g: Genome, maxCount: int = high(int)): seq[int] =
++  ## Counts are ALWAYS logarithmically uniform over the active operator range.
++  ## Local-search lanes deliberately use a smaller upper bound; exploration
++  ## lanes may still pass g.len and retain the full 1..N macro distribution.
+   ## Guidance chooses the first row, then unbiased sampling without replacement.
+-  let count = sampleLogUniformMutationCount(g.len)
++  let upper = min(g.len, max(1, maxCount))
++  let count = sampleLogUniformMutationRange(1, upper)
+   if count <= 0:
+     return @[]
+   result = newSeqOfCap[int](count)
+@@ -3391,9 +3405,10 @@
+   g[0].embedding = newMap
+   doAssert validEmbedding(g[0].embedding)
+ 
+-proc mutateEmbedding(g: var Genome, mutationScale: float) =
++proc mutateEmbedding(g: var Genome, mutationScale: float,
++                     mutationCountCap: int = high(int)) =
+   ## Permutation-aware swaps and rotations retain unique byte coordinates.
+-  ## Mutation counts remain log-uniform over the 256 dictionary entries.
++  ## Mutation counts remain log-uniform over the active lane cap (up to 256).
+   if g.len == 0 or g[0].embedding.len != EMBEDDING_ENTRY_COUNT: return
+   if rand(999) >= int(min(160.0, 45.0 * mutationScale)): return
+   var newMap = cloneEmbedding(g[0].embedding)
+@@ -3405,19 +3420,20 @@
+     if not occupied[code]:
+       freeCodes[freeCount] = code
+       inc freeCount
+-  let changed = sampleLogUniformMutationRange(1, EMBEDDING_ENTRY_COUNT)
++  let embeddingCap = min(EMBEDDING_ENTRY_COUNT, max(1, mutationCountCap))
++  let changed = sampleLogUniformMutationRange(1, embeddingCap)
+   for _ in 0 ..< changed:
+     let roll = rand(99)
+     if roll < 65:
+       let byte = rand(EMBEDDING_ENTRY_COUNT - 1)
+       let other = (byte + 1 + rand(EMBEDDING_ENTRY_COUNT - 2)) mod EMBEDDING_ENTRY_COUNT
+       swap(newMap[byte], newMap[other])
+-    elif roll < 90:
++    elif roll < 90 or embeddingCap < 2:
+       let byte = rand(EMBEDDING_ENTRY_COUNT - 1)
+       let freeIndex = rand(freeCount - 1)
+       swap(newMap[byte], freeCodes[freeIndex])
+     else:
+-      let length = sampleLogUniformMutationRange(2, EMBEDDING_ENTRY_COUNT)
++      let length = sampleLogUniformMutationRange(2, embeddingCap)
+       let start = rand(EMBEDDING_ENTRY_COUNT - length)
+       let old = newMap[start]
+       for j in start ..< start + length - 1:
+@@ -3459,28 +3475,31 @@
+ proc mutateGenome(
+   g: var Genome,
+   mutationScale: float = 1.0,
+-  stagnation: int = 0
++  stagnation: int = 0,
++  mutationCountCap: int = high(int)
+ ) =
+-  ## Every count-bearing rule mutation draws its size log-uniformly from 1..N.
+-  ## Event probabilities remain independent of the sampled mutation size.
++  ## Every count-bearing rule mutation remains log-uniform.  The exploitation
++  ## lane uses a bounded valid range so a near-converged 1500-rule program can
++  ## actually make small edits; the explicit exploration lane still uses 1..N.
+   if g.len == 0:
+     return
+   let inheritedEmbedding = g[0].embedding
++  let countCap = min(g.len, max(1, mutationCountCap))
+ 
+   # No temporal or branch allele: only a/b/weight may mutate.
+ 
+   # mutationScale changes event rates and perturbation magnitudes, not the
+-  # count distribution, which is always the same unrestricted log-uniform law.
++  # distribution family. Counts remain log-uniform inside this lane's cap.
+   let s = max(0.35, min(1.7, mutationScale))
+ 
+   # Keep the existing mutual exclusion of row/pattern/block categories.
+   # This does not cap the size of the single category selected.
+   var majorMutationUsed = false
+ 
+-  # Row swaps draw their affected-rule count from the full logarithmic range.
++  # Row swaps draw their affected-rule count from the lane's logarithmic range.
+   if not majorMutationUsed and rand(100) < int(min(45.0, 14.0 * s)):
+     if g.len >= 2:
+-      for i in pickMutationTargets(g):
++      for i in pickMutationTargets(g, countCap):
+         let offset = 1 + rand(g.len - 2)
+         let j = (i + offset) mod g.len
+         swap(g[i], g[j])
+@@ -3488,7 +3507,7 @@
+ 
+   # a <-> b: preserve its low activation probability; sample affected rows.
+   if not majorMutationUsed and rand(100) < int(min(28.0, 6.0 * s)):
+-    for i in pickMutationTargets(g):
++    for i in pickMutationTargets(g, countCap):
+       swap(g[i].a, g[i].b)
+       sanitizePatternWildcards(g[i])
+       ## a/bは親とseq共有され得る。sanitizeが必要な場合だけbをCOW。
+@@ -3502,7 +3521,7 @@
+ 
+   # Pattern/replacement mutation uses the same log-uniform target count.
+   if not majorMutationUsed and rand(100) < int(min(60.0, 26.0 * s)):
+-    for p in pickMutationTargets(g):
++    for p in pickMutationTargets(g, countCap):
+       let replacementOnly = rand(99) < 35
+       if not replacementOnly:
+         g[p].a = cloneInts(g[p].a)
+@@ -3546,7 +3565,7 @@
+   # A+(B-C)*{0,1}: change the sampled distinct rule rows.
+   if g.len >= 3 and rand(100) < int(min(55.0, 20.0 * s)):
+     var changed = newSeq[(int, float)]()
+-    for ai in pickMutationTargets(g):
++    for ai in pickMutationTargets(g, countCap):
+       var bi = rand(g.len - 1)
+       var ci = rand(g.len - 1)
+       while bi == ai:
+@@ -3574,16 +3593,16 @@
+ 
+   # Ordinary weight fine-tuning: event probability and sigma unchanged.
+   if rand(100) < int(min(60.0, 25.0 * s)):
+-    for p in pickMutationTargets(g):
++    for p in pickMutationTargets(g, countCap):
+       let oldWeight = g[p].weight
+       g[p].weight = signPreservingWeight(
+         oldWeight, oldWeight + gaussianDelta(0.05 * s)
+       )
+ 
+   # Building-block relocation/duplication remains an infrequent macro step.
+-  # Full-length reversal is still reachable by the unrestricted sampler.
++  # Full-length reversal remains reachable in the unrestricted exploration lane.
+   if not majorMutationUsed and g.len >= 16 and rand(1000) < 45:
+-    let blockLen = sampleLogUniformMutationCount(g.len)
++    let blockLen = sampleLogUniformMutationRange(1, countCap)
+     if blockLen == g.len:
+       # A full-genome block has no alternative insertion position; reversing
+       # the whole block keeps the sampled N-rule mutation meaningful.
+@@ -3610,7 +3629,7 @@
+ 
+   # Independent fine-tuning insurance: unchanged activation probability.
+   if rand(1000) < int(min(220.0, 120.0 + 140.0 * (s - 1.0))):
+-    for p in pickMutationTargets(g):
++    for p in pickMutationTargets(g, countCap):
+       let oldWeight = g[p].weight
+       g[p].weight = signPreservingWeight(
+         oldWeight, oldWeight + gaussianDelta(0.035 * s)
+@@ -3621,7 +3640,7 @@
+   # Guided selection preferentially targets currently harmful rules.
+   let signFlipPermille = int(min(18.0, 4.0 + 8.0 * (s - 1.0)))
+   if rand(999) < signFlipPermille:
+-    for p in pickMutationTargets(g):
++    for p in pickMutationTargets(g, countCap):
+       if abs(g[p].weight) >= WEIGHT_SIGN_FLOOR:
+         g[p].weight = clampWeight(-g[p].weight)
+ 
+@@ -3631,17 +3650,18 @@
+   g[0].embedding = inheritedEmbedding
+   for i in 1 ..< g.len:
+     g[i].embedding = @[]
+-  mutateEmbedding(g, s)
++  mutateEmbedding(g, s, countCap)
+ 
+   # ここで全ルールを再sanitizeするのは非常に重い。
+   # a/bを直接変える各mutation pathでは、そのruleだけ既にsanitize済み。
+   # crossover側もcompatibleRuleを通したruleしか移植しないので全走査は不要。
+ 
+ proc diversifyExactCopy(g: var Genome) =
+-  ## Explicit novelty event; preserve nonzero weight signs. Target count still
+-  ## follows the full-range log-uniform distribution, including 1 and N.
++  ## Explicit novelty event; preserve nonzero weight signs. A duplicate rescue
++  ## should be the smallest reliable nudge, not a hidden macro-mutation lane.
++  ## The count remains log-uniform, bounded to at most 32 rows.
+   if g.len == 0: return
+-  for id in pickMutationTargets(g):
++  for id in pickMutationTargets(g, min(32, g.len)):
+     let oldWeight = g[id].weight
+     let step = 0.005 + min(0.1, abs(gaussianDelta(0.015)))
+     let magnitude = abs(oldWeight)
+@@ -4098,18 +4118,21 @@
+ 
+ proc rebuildRollingRefreshCredit(nextIter: int) =
+   rollingRefreshCredit.fill(0)
+-  const add = [6, 22, 33] # FAST=1/11, MEDIUM=1/3, SLOW=1/2 on denominator 66
++  # Two cases live in each timescale.  Refresh only ONE case per event, so an
++  # event cadence of 1/4, 1/8, 1/16 gives each individual case an average
++  # lifetime of 8/16/32 generations.  Denominator 16 keeps the scheduler exact.
++  const add = [4, 2, 1] # FAST event=1/4, MEDIUM=1/8, SLOW=1/16
+   for generation in 1 ..< max(1, nextIter):
+     discard generation
+     for group in 0 .. 2: rollingRefreshCredit[group] += add[group]
+     var chosen = -1
+     var best = -1
+     for group in 0 .. 2:
+-      if rollingRefreshCredit[group] >= 66 and
++      if rollingRefreshCredit[group] >= 16 and
+          (chosen < 0 or rollingRefreshCredit[group] > best):
+         chosen = group
+         best = rollingRefreshCredit[group]
+-    if chosen >= 0: rollingRefreshCredit[chosen] -= 66
++    if chosen >= 0: rollingRefreshCredit[chosen] -= 16
+ 
+ # Checkpoint-v9 compatibility field. v4 used this as a chain-linked dataset
+ # difficulty offset for plotting, but that estimator was biased because the
+@@ -4127,12 +4150,11 @@
+   if caseCount < 3:
+     return 1.0
+   # More stable (less frequently refreshed) cases receive more long-term
+-  # aggregate weight. With requested SLOW:MEDIUM:FAST = 2:3:11, FAST is now
+-  # actually the most stable historical label.
++  # aggregate weight.  Per-case lifetimes are FAST/MEDIUM/SLOW = 8/16/32.
+   case caseId mod 3
+-  of FAST_ROLLING_SLOT: result = 3.0
++  of FAST_ROLLING_SLOT: result = 1.0
+   of MEDIUM_ROLLING_SLOT: result = 2.0
+-  of SLOW_ROLLING_SLOT: result = 1.0
++  of SLOW_ROLLING_SLOT: result = 3.0
+   else: result = 1.0
+ 
+ proc rollingCaseMaturity(caseId, caseCount: int): float {.inline.} =
+@@ -4142,9 +4164,9 @@
+     return 1.0
+   var rampGenerations = 1
+   case caseId mod 3
+-  of FAST_ROLLING_SLOT: rampGenerations = 5   # half of requested width 11
+-  of MEDIUM_ROLLING_SLOT: rampGenerations = 1 # half of requested width 3
+-  of SLOW_ROLLING_SLOT: rampGenerations = 1   # half of requested width 2
++  of FAST_ROLLING_SLOT: rampGenerations = 4
++  of MEDIUM_ROLLING_SLOT: rampGenerations = 8
++  of SLOW_ROLLING_SLOT: rampGenerations = 16
+   else: discard
+   let age = if caseId >= 0 and caseId < rollingCaseAge.len:
+               rollingCaseAge[caseId]
+@@ -5253,10 +5275,11 @@
+ 
+ let eliteCount = 40
+ 
+-# 世代交代時に Elite-of-Elites から「そのまま戻す」個体数。
+-# pop_size=450。定数40体を維持して既存の選抜基準は変更しない。
+-const ARCHIVE_INJECT_COUNT = 40
+-const ARCHIVE_INJECT_INTERVAL = 1
++# Elite-of-Elites is a diversity reservoir, not a second elite population.
++# Keep reinjection small and periodic so historical genomes do not consume the
++# merit FULL-evaluation bandwidth every generation.
++const ARCHIVE_INJECT_COUNT = 8
++const ARCHIVE_INJECT_INTERVAL = 4
+ # 長時間運転で「新記録」のたびに1500-rule genomeを無制限に保持すると
+ # アーカイブだけでメモリを食い潰す可能性があるため上限を設ける。
+ const ARCHIVE_MAX_ENTRIES = 2048
+@@ -5267,20 +5290,18 @@
+ # 粗密二段階評価。全個体を薄いサンプルで一次選抜し、
+ # 上位だけ完全評価する。個体数が増えても計算量が素直に増えにくい。
+ # FAST sample thinning. Higher stride = fewer observations = faster screening.
+-# Start substantially thinner than the old 4, but retain a 4-point safety floor
+-# that the rejection audit can fall back to. Clean high-correlation generations
+-# may climb as far as 8 (roughly half the observations of stride=4 on 40-point cases).
+-const FAST_EVAL_STRIDE = 6
+-const FAST_EVAL_STRIDE_MIN = 4
+-const FAST_EVAL_STRIDE_MAX = 8
++# On a 20-point case, stride 3 keeps about eight rank points and stride 2 keeps
++# about eleven. Temporal execution itself is never truncated.
++const FAST_EVAL_STRIDE = 3
++const FAST_EVAL_STRIDE_MIN = 2
++const FAST_EVAL_STRIDE_MAX = 3
+ var adaptiveFastEvalStride = FAST_EVAL_STRIDE
+ const FULL_EVAL_TOP = 42
+-# The former "CAP=12" was BELOW the initial/max 16: a failed audit reduced
+-# FAST work 16 -> 12, while a good correlation increased it 12 -> 16.
+-const FAST_EVAL_MIN_ROUNDS = 12
+-const FAST_EVAL_MAX_ROUNDS = 16
++# FAST differs from FULL only in sampled observations.  Truncating temporal
++# execution changes the phenotype of an iterative replacement program, so both
++# tiers must run the same natural sqrt(input)-bounded evaluator.
++const FAST_EVAL_ROUNDS = SCORE_ROUNDS
+ const ADAPTIVE_FULL_EXTRA_MAX = 8
+-var adaptiveFastEvalRounds = FAST_EVAL_MAX_ROUNDS
+ # FULL評価は上位だけに閉じず、親候補の遺伝的多様性を確保するため
+ # 毎世代ランダムな個体も追加で完全評価する。
+ const FULL_EVAL_DIVERSITY_EXTRA = 8
+@@ -5296,6 +5317,13 @@
+ const IMMIGRANT_RATE = 0.005
+ const STAGNATION_IMMIGRANT_BONUS = 0.03
+ 
++# Local refinement must remain genuinely local once a 1500-rule genome is
++# already good. Counts are still log-uniform; only the valid upper bound differs
++# by lane. Exploration keeps the full 1..N range.
++const LOCAL_MUTATION_MAX_RULES = 32
++const CROSSOVER_MUTATION_PERCENT = 60
++const CROSSOVER_TRACE_SAMPLE_COUNT = 12
++
+ # パターンキャッシュを定期的にクリアする間隔。
+ # 無制限に貯め続けるとユニークな .a 列の総数に比例してメモリが
+ # 増え続けるため、ある程度で捨てて作り直す。世代内の再利用効果は
+@@ -5724,8 +5752,8 @@
+     fixedMovingAvg: float
+ 
+ const CHECKPOINT_MAGIC = "KLEISMIC_GA_CHECKPOINT"
+-const CHECKPOINT_VERSION = 27
+-const CHECKPOINT_OBJECTIVE_VERSION = 27 # 512-token objective
++const CHECKPOINT_VERSION = 28
++const CHECKPOINT_OBJECTIVE_VERSION = 28 # stabilized 6x20 rolling objective
+ var migratedRuleCount = false
+ var loadedCheckpointVersion = 0
+ const CHECKPOINT_INTERVAL = 50
+@@ -6294,7 +6322,7 @@
+       raise newException(IOError, "Invalid checkpoint magic: " & path)
+ 
+     let version = int(fs.readInt64())
+-    if version < 3 or (version > 9 and version notin [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, CHECKPOINT_VERSION]):
++    if version < 3 or (version > 9 and version notin [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, CHECKPOINT_VERSION]):
+       raise newException(IOError, "Unsupported checkpoint version: " & $version)
+ 
+     nextIter = int(fs.readInt64())
+@@ -6311,6 +6339,9 @@
+       var offsetCount = MULTI_CASE_COUNT
+       if version == 9:
+         offsetCount = 3
++      elif version == 27:
++        # v27 in this branch stored three rolling-case offsets. v28 stores six.
++        offsetCount = 3
+       elif version == 16:
+         let offsetStart = fs.getPosition()
+         fs.setPosition(offsetStart + 3 * sizeof(float64))
+@@ -6323,7 +6354,9 @@
+         fs.setPosition(offsetStart)
+         echo "[checkpoint] detected v16 layout: case_offsets=", offsetCount
+       for ci in 0 ..< offsetCount:
+-        progressSigmaOffset[ci] = fs.readFloat64()
++        let storedOffset = fs.readFloat64()
++        if ci < MULTI_CASE_COUNT:
++          progressSigmaOffset[ci] = storedOffset
+ 
+     let maLen64 = fs.readInt64()
+     if maLen64 < 0 or maLen64 > 10_000_000:
+@@ -6472,15 +6505,13 @@
+   progressCsvLastWrittenIndex = xs.len - 1
+ 
+ 
+-# Requested rolling widths, in the user's literal SLOW:MEDIUM:FAST order = 2:3:11.
+-# The labels are historical; scheduling is deadline-based below. Since
+-# 1/2 + 1/3 + 1/11 < 1, at most ONE case group is refreshed per generation,
+-# eliminating simultaneous cache invalidation/objective shocks while keeping
+-# the requested average cadences.
++# Per-case target lifetimes.  There are two cases in each timescale and the
++# scheduler refreshes only one case at a time, so group-level events occur at
++# half these intervals (4/8/16 generations).
+ const DATASET_CHUNKS = MULTI_CASE_COUNT
+-const SLOW_DATASET_REFRESH_INTERVAL = 2
+-const MEDIUM_DATASET_REFRESH_INTERVAL = 3
+-const FAST_DATASET_REFRESH_INTERVAL = 11
++const FAST_DATASET_REFRESH_INTERVAL = 8
++const MEDIUM_DATASET_REFRESH_INTERVAL = 16
++const SLOW_DATASET_REFRESH_INTERVAL = 32
+ 
+ proc rollingAgeAtResume(nextIter, firstRefresh, interval: int): int {.inline.} =
+   ## checkpointはrollingCaseAgeを保存していない旧形式とも互換にする。
+@@ -6656,12 +6687,23 @@
+   ioX: var seq[seq[seq[int]]], ioY: var seq[seq[int]],
+   group: int, refreshedCases: var array[MULTI_CASE_COUNT, bool]
+ ): bool =
++  ## With two cases per timescale, replacing both together still creates a
++  ## large objective jump. Refresh exactly ONE slot: the oldest member of the
++  ## selected timescale. This preserves rolling diversity without synchronized
++  ## case shocks and requires no extra checkpoint state.
++  var target = -1
++  var oldest = -1
+   for ci in countup(group, MULTI_CASE_COUNT - 1, 3):
+-    let changed = refreshDatasetSlot(chunks, cursor, ioX, ioY, ci)
+-    refreshedCases[ci] = changed
+-    if changed:
+-      rollingCaseAge[ci] = 0
+-      result = true
++    if ci < rollingCaseAge.len and rollingCaseAge[ci] > oldest:
++      oldest = rollingCaseAge[ci]
++      target = ci
++  if target < 0:
++    return false
++  let changed = refreshDatasetSlot(chunks, cursor, ioX, ioY, target)
++  refreshedCases[target] = changed
++  if changed:
++    rollingCaseAge[target] = 0
++    result = true
+ 
+ # Standalone inference V2: the training winner, Unicode alphabet, smoothed corpus
+ # character frequencies and short corpus n-grams. Old V1 .model files still load.
+@@ -9070,18 +9112,12 @@
+     doAssert replaceSeq(@[97, 97, 97], @[97, 97], @[98]) == @[98, 97]
+   echo "PASS: overlapping occurrence lookup without overlapping replacements"
+   block:
+-    var rounds = FAST_EVAL_MAX_ROUNDS
+-    rounds = max(FAST_EVAL_MIN_ROUNDS, rounds - 1)
+-    doAssert rounds == FAST_EVAL_MAX_ROUNDS - 1
+-    rounds = min(FAST_EVAL_MAX_ROUNDS, rounds + 2)
+-    doAssert rounds == FAST_EVAL_MAX_ROUNDS
+-    rounds = FAST_EVAL_MIN_ROUNDS
+-    rounds = max(FAST_EVAL_MIN_ROUNDS, rounds - 1)
+-    doAssert rounds == FAST_EVAL_MIN_ROUNDS
++    # FAST may thin observations, but must execute the same iterative program.
++    doAssert FAST_EVAL_ROUNDS == SCORE_ROUNDS
+     # This test doesn't require loading a corpus or initializing global RNG.
+     doAssert corpusByteCount.len == EMBEDDING_ENTRY_COUNT
+     doAssert corpusByteCum.len == EMBEDDING_ENTRY_COUNT
+-  echo "PASS: FAST controller bounds and sentinel-free byte sampling domain"
++  echo "PASS: FAST uses FULL temporal semantics and sentinel-free byte sampling domain"
+   echo "PASS: log-uniform sparse selection exactly matches legacy Fisher-Yates"
+   echo "PASS: unrestricted sampler preserved for macro mutation exploration"
+   # Invalid wildcard candidates must not allocate/copy the unmatched input;
+@@ -9921,7 +9957,7 @@
+   doAssert abs(aggregateCaseScores(scores) - 1.0) < 1.0e-12
+   for ci in 0 ..< MULTI_CASE_COUNT:
+     scores[ci] = 0.0
+-    let expectedDrop = float(3 - ci mod 3) / float(6 * CASES_PER_TIMESCALE)
++    let expectedDrop = float(1 + ci mod 3) / float(6 * CASES_PER_TIMESCALE)
+     doAssert abs(1.0 - aggregateCaseScores(scores) - expectedDrop) < 1.0e-12
+     scores[ci] = 1.0
+   let indices = retainedTrajectoryIndices(RETAINED_SAMPLES_PER_CASE, 18)
+@@ -10016,7 +10052,7 @@
+     maReset()
+     bestEver = -Inf
+     stagnation = 0
+-    echo "[migration] v27 512-token objective: old scores/archive/Jev Hall discarded; genomes migrated"
++    echo "[migration] v28 stabilized 6x20 objective: old scores/archive/Jev Hall discarded; genomes retained"
+   if loadedCheckpointVersion < 16:
+     # Remove stale history and old-objective archives; preserve population.
+     # Archival genomes were selected by incompatible branch scores.
+@@ -10048,20 +10084,20 @@
+   # the first 400 indices (including protected survivors) remain unchanged.
+   expandLoadedPopulation(population)
+ 
+-  # Migrate older case counts while preserving genomes and archive entries.
+-  # Reset plotted history because 3-case and 9-case objectives differ.
++  # Migrate older case counts while preserving genomes. Reset plotted history
++  # because the old three/nine-case objectives are not comparable to 6x20.
+   if evalAggsX.len != DATASET_CHUNKS or evalAggsY.len != DATASET_CHUNKS:
+     # 旧case数checkpointだけruntime評価集合を作り直す。現在はcorpus順を
+     # 学習時系列へ持ち込まないランダムrollingなので、cursorの巻き戻しはしない。
+     rebuildDataset(sourceChunks, sourceChunkCursor, evalAggsX, evalAggsY)
+     progressHistory.setLen(0)
+-    eliteOfElites.setLen(0) # Different 3/9-case objective: old archive scores cannot be reused.
++    eliteOfElites.setLen(0) # Different rolling objective: old archive scores cannot be reused.
+     maReset()
+     maHistory.setLen(0)
+     bestEver = -Inf
+     stagnation = 0
+     for ci in 0 ..< MULTI_CASE_COUNT: rollingCaseAge[ci] = 64
+-    echo "[migration] genomes retained; incompatible archive/fitness history cleared; nine cases rebuilt"
++    echo "[migration] genomes retained; incompatible archive/fitness history cleared; six 20-point cases rebuilt"
+ 
+   # Old checkpoints contain sampled/history-dependent damage labels.
+   # The first observation is the original base; relabel without discarding genomes.
+@@ -10133,7 +10169,7 @@
+   eliteOfElites.setLen(0)
+ 
+ echo "evaluation mode: parallel individual evaluation (--threads:on)"
+-echo "rolling evaluation schedule: fast=11, medium=3, slow=2; credit scheduler, at most one refresh per generation"
++echo "rolling evaluation: 6 cases x 20 points; per-case lifetime fast=8, medium=16, slow=32; one case refresh max/generation"
+ 
+ # stagnation判定は、32世代だけ保持されるslow rolling case上の改善で測る。
+ # case交換そのものを「悪化」扱いしないため、slow case交換直後はbaselineだけ張り直す。
+@@ -10289,38 +10325,36 @@
+   reseedForGeneration(iter)
+   for ci in 0 ..< MULTI_CASE_COUNT:
+     rollingCaseAge[ci] = min(1000000, rollingCaseAge[ci] + 1)
+-  # Rolling evaluation with requested SLOW:MEDIUM:FAST widths 2:3:11.
+-  # A naive modulo schedule creates periodic double/triple refreshes. Integer
+-  # credits preserve those average rates while allowing at most one refresh per
+-  # generation, preventing refresh-induced FULL-evaluation spikes.
++  # Rolling evaluation: two cases per timescale, with per-case average
++  # lifetimes FAST/MEDIUM/SLOW = 8/16/32 generations. A credit scheduler emits
++  # at most one single-case refresh per generation, avoiding objective shocks.
+   var refreshedCases: array[MULTI_CASE_COUNT, bool]
+   var datasetChanged = false
+   var refreshedFast = false
+   var refreshedMedium = false
+   var refreshedSlow = false
+   if iter > 0:
+-    # 66 is lcm(2,3,11). Add exact rational credits 6/66, 22/66, 33/66
+-    # each generation and spend at most one 66-credit refresh. Total offered
+-    # load is 61/66 < 1, so no long-run backlog is required and average rates
+-    # converge exactly to 1/11, 1/3, 1/2 without double-refresh generations.
+-    const refreshCreditAdd = [6, 22, 33] # FAST, MEDIUM, SLOW
++    # Group events at 1/4, 1/8, 1/16. Because each event refreshes the oldest
++    # ONE of two cases, each case lives about 8/16/32 generations on average.
++    # Total offered load is 7/16 < 1, so the one-refresh-per-generation cap has
++    # ample slack and no sustained backlog.
++    const refreshCreditAdd = [4, 2, 1] # FAST, MEDIUM, SLOW; denominator 16
+     for group in 0 .. 2: rollingRefreshCredit[group] += refreshCreditAdd[group]
+     var chosenGroup = -1
+     var bestCredit = -1
+     for group in 0 .. 2:
+-      if rollingRefreshCredit[group] >= 66 and
++      if rollingRefreshCredit[group] >= 16 and
+          (chosenGroup < 0 or rollingRefreshCredit[group] > bestCredit):
+         chosenGroup = group
+         bestCredit = rollingRefreshCredit[group]
+     if chosenGroup >= 0:
+-      rollingRefreshCredit[chosenGroup] -= 66
++      rollingRefreshCredit[chosenGroup] -= 16
+       let changed = refreshDatasetGroup(
+         sourceChunks, sourceChunkCursor, evalAggsX, evalAggsY, chosenGroup,
+         refreshedCases
+       )
+       datasetChanged = changed
+       if changed:
+-        rollingCaseAge[chosenGroup] = 0
+         case chosenGroup
+         of FAST_ROLLING_SLOT: refreshedFast = true
+         of MEDIUM_ROLLING_SLOT: refreshedMedium = true
+@@ -10454,7 +10488,7 @@
+     unsafeAddr fastAggsY,
+     unsafeAddr fastRankedY,
+     AAA,
+-    adaptiveFastEvalRounds,
++    FAST_EVAL_ROUNDS,
+     "FAST"
+   )
+   var fastCaseScores = newSeq[seq[float]](pop_size)
+@@ -10473,7 +10507,10 @@
+   # Previously FULL_EVAL_TOP=42 included incumbents that were going to be FULL
+   # evaluated anyway. Preserve a similar total FULL budget but guarantee a
+   # useful number of distinct, screened newcomers in each generation.
+-  let fullCount = min(max(16, FULL_EVAL_TOP - protectedCount), screeningOrder.len)
++  # Protected survivors/archive entries are already paid incumbents; they must
++  # not subtract from the number of NEW offspring that receive a proper FULL
++  # merit evaluation.  Keep a stable innovation bandwidth every generation.
++  let fullCount = min(FULL_EVAL_TOP, screeningOrder.len)
+ 
+   # ------------------------------------------------------------
+   # ★重要: elitism を FAST 評価に依存させない。
+@@ -10863,7 +10900,7 @@
+ 
+   # The independent audit is included in FULL-ranked selection and in the
+   # paired FAST/FULL correlation above; its observed misses also expand FULL.
+-  # FAST has two independent cost knobs: temporal rounds and sample stride.
++  # FAST now has one semantic-safe cost knob: sample stride.
+   # Higher stride means fewer sampled observations. A single small merit miss is
+   # deliberately treated as a HOLD signal rather than immediately forcing the
+   # old dense stride=3 behavior. Genuine best misses / repeated or large misses
+@@ -10872,13 +10909,10 @@
+   let severeAuditMiss = auditMissedBest > 0 or auditMissedMerit >= 2 or
+     (auditMissedMerit > 0 and auditMaxMargin > FAST_AUDIT_SEVERE_MARGIN)
+   if severeAuditMiss:
+-    adaptiveFastEvalRounds = min(FAST_EVAL_MAX_ROUNDS, adaptiveFastEvalRounds + 2)
+     adaptiveFastEvalStride = max(FAST_EVAL_STRIDE_MIN, adaptiveFastEvalStride - 1)
+   elif screeningCorr < 0.66:
+-    adaptiveFastEvalRounds = min(FAST_EVAL_MAX_ROUNDS, adaptiveFastEvalRounds + 2)
+     adaptiveFastEvalStride = max(FAST_EVAL_STRIDE_MIN, adaptiveFastEvalStride - 1)
+   elif screeningCorr < 0.76:
+-    adaptiveFastEvalRounds = min(FAST_EVAL_MAX_ROUNDS, adaptiveFastEvalRounds + 1)
+     if auditMissedMerit > 0:
+       adaptiveFastEvalStride = max(FAST_EVAL_STRIDE_MIN, adaptiveFastEvalStride - 1)
+   elif auditMissedMerit == 1:
+@@ -10886,10 +10920,8 @@
+     # not enough evidence to pay for a denser dataset next generation.
+     discard
+   elif screeningCorr > 0.93:
+-    adaptiveFastEvalRounds = max(FAST_EVAL_MIN_ROUNDS, adaptiveFastEvalRounds - 2)
+     adaptiveFastEvalStride = min(FAST_EVAL_STRIDE_MAX, adaptiveFastEvalStride + 1)
+   elif screeningCorr > 0.86:
+-    adaptiveFastEvalRounds = max(FAST_EVAL_MIN_ROUNDS, adaptiveFastEvalRounds - 1)
+     adaptiveFastEvalStride = min(FAST_EVAL_STRIDE_MAX, adaptiveFastEvalStride + 1)
+ 
+   if adaptiveFastEvalStride != previousFastStride:
+@@ -10907,7 +10939,7 @@
+   fastPointsSummary.add("]")
+   echo "  screening fast/full spearman=", formatFloat(screeningCorr, ffDecimal, 3),
+        " adaptive_extra=", adaptiveExtraIds.len,
+-       " fast_rounds_next=", adaptiveFastEvalRounds,
++       " fast_rounds=FULL,",
+        " fast_stride_next=", adaptiveFastEvalStride,
+        " fast_points_next=", fastPointsSummary,
+        " lex_eps=", adaptiveLexicaseEpsilon
+@@ -11597,7 +11629,7 @@
+        " immigrant=", formatFloat(adaptiveImmigrantRate, ffDecimal, 3)
+ 
+   # この世代の先頭で次世代へそのまま継ぐ個体数を正確に覚える。
+-  # archiveが10件埋まらなかった場合に、ただの子個体まで次世代FULL保護しない。
++  # archiveが8件埋まらなかった場合に、ただの子個体まで次世代FULL保護しない。
+   let nextProtectedPrefixCount = new_population.len
+ 
+   # Shared-input, one-path execution fingerprints are generated once per
+@@ -11609,8 +11641,12 @@
+   var traceSamples: seq[seq[int]] = @[]
+   for ci in 0 ..< evalAggsX.len:
+     if evalAggsX[ci].len > 0:
+-      traceSamples.add(evalAggsX[ci][0])
+-    if traceSamples.len >= 2: break
++      # Two points per trajectory spread traces over both clean-ish and damaged
++      # states instead of inferring module boundaries from only two total texts.
++      for si in retainedTrajectoryIndices(evalAggsX[ci].len, 2):
++        traceSamples.add(evalAggsX[ci][si])
++        if traceSamples.len >= CROSSOVER_TRACE_SAMPLE_COUNT: break
++    if traceSamples.len >= CROSSOVER_TRACE_SAMPLE_COUNT: break
+   proc parentTrace(id: int): RuleTrace =
+     if not traceReady[id]:
+       let started = epochTime()
+@@ -11631,7 +11667,7 @@
+     if survivorIds.len == 0: break
+     let parent = rand(min(coreEliteCount, survivorIds.len) - 1)
+     var probeChild = cloneGenome(new_population[parent])
+-    mutateGenome(probeChild, feedbackMutationScale, 0)
++    mutateGenome(probeChild, feedbackMutationScale, 0, LOCAL_MUTATION_MAX_RULES)
+     mutationProbes.add((parent: parent, child: new_population.len))
+     new_population.add(probeChild)
+ 
+@@ -11748,7 +11784,6 @@
+     let p1 = population[p1i]
+     let p2 = population[p2i]
+ 
+-    # 全子個体を必ず交叉すると、良い骨格を保存した局所探索の経路がなくなる。
+     # 40%は高fitness親のasexual cloneから始め、mutationだけで近傍探索する。
+     # rolling objective下では交叉を毎回掛けすぎると、case shockの直後に良い骨格まで
+     # 同時に組み替えてしまうため、局所探索laneを少し太くする。
+@@ -11770,13 +11805,21 @@
+       inc crossoverLastCounts[op]
+       crossoverLastSeconds[op] += epochTime() - started
+ 
+-    # Keep broader exploration in a minority lane; most children follow the
+-    # measured local mutation scale, even during slow-case stagnation.
+-    let explorationLane = rand(99) < 20
+-    let mutationScale = if explorationLane:
+-                          min(1.7, 1.0 + 0.55 * stagnationPressure)
+-                        else: feedbackMutationScale
+-    mutateGenome(child, mutationScale, if explorationLane: stagnation else: 0)
++    # Keep three distinct variation modes instead of forcing every crossover
++    # product through another mutation immediately:
++    #   asexual -> mutation-only
++    #   crossover -> 60% crossover+mutation, 40% crossover-only
++    # Mutated children use bounded log-uniform edits in the exploitation lane;
++    # a minority exploration lane keeps the original full 1..N distribution.
++    let shouldMutate = (not didCrossover) or rand(99) < CROSSOVER_MUTATION_PERCENT
++    if shouldMutate:
++      let explorationLane = rand(99) < 20
++      let mutationScale = if explorationLane:
++                            min(1.7, 1.0 + 0.55 * stagnationPressure)
++                          else: feedbackMutationScale
++      let mutationCap = if explorationLane: child.len else: LOCAL_MUTATION_MAX_RULES
++      mutateGenome(child, mutationScale,
++        if explorationLane: stagnation else: 0, mutationCap)
+     let childFingerprint = rescueDuplicateOffspring(child, new_population,
+       offspringBuckets, rescuedDuplicates, unresolvedDuplicates)
+     # Count only actual parent contributions. A subsequent diversity replacement

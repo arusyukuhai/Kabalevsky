@@ -1,0 +1,481 @@
+--- /mnt/data/at_jev_v34_speed_guard.nim	2026-09-25 10:06:06.499442576 +0000
++++ /mnt/data/v35work/at_jev.nim	2026-09-25 10:21:06.786118601 +0000
+@@ -36,6 +36,10 @@
+ # v34: runtime-bloat guard for FAST: deterministic scan-work budgets, adaptive
+ #      stride up to 5, correlation-sized race pools, and stronger near-tie
+ #      runtime Pareto pressure. FULL objective/rounds remain unchanged.
++# v35: audit/hardening: literal identity rules no longer rebuild+compare whole
++#      states, FAST budget failures invalidate the entire race candidate, controller
++#      state survives checkpoints, and Jev inner searches use paired random streams
++#      plus global memo duplicate repair for fairer/faster 64x6400 comparisons.
+ # Audit: bounded parent pools, exact-duplicate rescue, cached distance minima.
+ # Build: nim c -d:release --threads:on at.nim
+ # Verify: ./at --regression-test && ./at --self-test
+@@ -1360,7 +1364,8 @@
+   overflowed: ptr bool = nil,
+   maxOutput: int = MAX_REPLACE_OUTPUT,
+   replacementRevision: uint64 = 0'u64,
+-  cachedRevision: ptr uint64 = nil
++  cachedRevision: ptr uint64 = nil,
++  outputChanged: ptr bool = nil
+ ): bool {.gcsafe.} =
+   ## replaceSeq のコア処理。
+   ##
+@@ -1376,6 +1381,7 @@
+ 
+   var overflow = false
+   if overflowed != nil: overflowed[] = false
++  if outputChanged != nil: outputChanged[] = false
+ 
+   if pat.wildcardCount == 0:
+     let literal = pat.parts[0]
+@@ -1396,6 +1402,31 @@
+ 
+     ensureReplacementPlan(replacement, replacementPlan,
+       replacementRevision, cachedRevision)
++
++    # scoreRaw only needs the rewritten state when the replacement actually
++    # changes bytes/tokens.  Literal identity rules used to rebuild the whole
++    # state and then pay an O(state.len) seq comparison in the caller.  For a
++    # no-wildcard pattern every matched span is exactly `literal`; capture/filter
++    # opcodes are inert, so compare the effective literal output once and return
++    # immediately when it is identical.  The public helper keeps outputChanged
++    # nil and therefore preserves its historical materialized-output contract.
++    if outputChanged != nil:
++      var effectiveLen = 0
++      var sameLiteral = true
++      for oi in 0 ..< int(replacementPlan[].len):
++        let op = replacementPlan[].ops[oi]
++        if op.kind != 0'u8:
++          continue
++        if effectiveLen >= literal.data.len or op.value != literal.data[effectiveLen]:
++          sameLiteral = false
++        inc effectiveLen
++      if effectiveLen != literal.data.len:
++        sameLiteral = false
++      if sameLiteral:
++        outputChanged[] = false
++        return true
++      outputChanged[] = true
++
+     outp.setLen(0)
+     var copyPos = 0
+     var i = firstMatch
+@@ -1450,6 +1481,7 @@
+   # 出力バッファは呼び出し側から再利用する。
+   # これにより「ruleが1回発火するたびに新しいseqを確保」を防ぐ。
+   var changed = false
++  var anyOutputChanged = false
+   var pos = 0
+ 
+   var cachedStart = -1
+@@ -1502,10 +1534,22 @@
+             return false
+           appendIntsBulk(outp, input, pos, nextStart - pos)
+ 
++        let replacementStart = outp.len
+         appendReplacementPlan(
+           outp, replacementPlan, input, scratch.captures, pat.wildcardCount,
+           scratch, overflow, maxOutput
+         )
++        if outputChanged != nil and not anyOutputChanged:
++          let replacementLen = outp.len - replacementStart
++          let matchedLen = m2.finish - nextStart
++          if replacementLen != matchedLen:
++            anyOutputChanged = true
++          else:
++            var j = 0
++            while j < replacementLen and
++                  outp[replacementStart + j] == input[nextStart + j]:
++              inc j
++            anyOutputChanged = j != replacementLen
+         if overflow:
+           if overflowed != nil: overflowed[] = true
+           outp.setLen(0)
+@@ -1532,10 +1576,22 @@
+         return false
+       appendIntsBulk(outp, input, pos, start - pos)
+ 
++    let replacementStart = outp.len
+     appendReplacementPlan(
+       outp, replacementPlan, input, scratch.captures, pat.wildcardCount,
+       scratch, overflow, maxOutput
+     )
++    if outputChanged != nil and not anyOutputChanged:
++      let replacementLen = outp.len - replacementStart
++      let matchedLen = m.finish - start
++      if replacementLen != matchedLen:
++        anyOutputChanged = true
++      else:
++        var j = 0
++        while j < replacementLen and
++              outp[replacementStart + j] == input[start + j]:
++          inc j
++        anyOutputChanged = j != replacementLen
+     if overflow:
+       if overflowed != nil: overflowed[] = true
+       outp.setLen(0)
+@@ -1555,6 +1611,8 @@
+       return false
+     appendIntsBulk(outp, input, pos, input.len - pos)
+ 
++  if outputChanged != nil:
++    outputChanged[] = anyOutputChanged
+   true
+ 
+ 
+@@ -3988,6 +4046,7 @@
+         continue
+       var replacementOverflow = false
+       var matched = false
++      var stateChangedByRule = false
+       chargeEvaluationScanWork(budget, state.len)
+       try:
+         matched = replaceSeqCompiledInto(state, compiled[k], genome[k].b,
+@@ -3995,7 +4054,8 @@
+           addr evalScratch.replacementPlans[k],
+           addr replacementOverflow, maxAggLen,
+           genome[k].replacementRevision,
+-          addr evalScratch.replacementPlanRevision[k])
++          addr evalScratch.replacementPlanRevision[k],
++          addr stateChangedByRule)
+       except Defect as e:
+         raise newException(SeqReplaceError,
+           "replacement crashed: rule=" & $k & " state.len=" & $state.len &
+@@ -4014,7 +4074,7 @@
+       rewrote = true
+       roundScore += genome[k].weight
+       if needFeatures: roundFeatures[k] += 1.0
+-      if evalScratch.bufB != state:
++      if stateChangedByRule:
+         swap(state, evalScratch.bufB)
+         candidateValid = false
+       inc k
+@@ -5200,11 +5260,14 @@
+   maxRuleVisits: int = EVAL_MAX_RULE_VISITS,
+   maxSampleSeconds: float = EVAL_MAX_SAMPLE_SECONDS,
+   clockCheckVisits: int = EVAL_CLOCK_CHECK_VISITS,
+-  maxScanWork: int64 = 0
++  maxScanWork: int64 = 0,
++  budgetFailed: ptr seq[bool] = nil
+ ): seq[seq[float]] {.gcsafe.} =
+   result = newSeq[seq[float]](ids.len)
+   if measuredTimings != nil:
+     measuredTimings[] = newSeq[seq[float]](ids.len)
++  if budgetFailed != nil:
++    budgetFailed[] = newSeq[bool](ids.len)
+   if ids.len == 0:
+     return
+   # parallelEvaluateIndividualBatch と同じ理由で、バッチ分割の
+@@ -5226,6 +5289,8 @@
+   for j in 0 ..< ids.len:
+     let outcome = ^jobs[j]
+     totalBudgetFailures += outcome.exceededCases
++    if budgetFailed != nil and outcome.exceededCases > 0:
++      budgetFailed[][j] = true
+     if outcome.error.len > 0:
+       let message = "evaluation failure: phase=" & phase &
+         " id=" & $ids[j] & " rounds=" & $maxRounds & " " & outcome.error
+@@ -5512,6 +5577,10 @@
+ const FAST_SCAN_WORK_MAX = 160_000_000'i64
+ const FAST_MAX_RULE_VISITS = 600_000
+ var adaptiveFastScanWork = FAST_SCAN_WORK_DEFAULT
++# Persisted screening-controller state.  Without checkpointing these values a
++# restart silently widened the race and reset the anti-bloat cap for several
++# generations, producing a repeatable post-resume slowdown.
++var lastScreeningCorrelation = 0.85
+ # Sequential race: every optional offspring first sees exactly one case from each
+ # FAST/MEDIUM/SLOW timescale.  Only contenders receive the remaining cases.
+ # The final race pool is >= FULL_EVAL_TOP_MAX, so every merit FULL candidate can
+@@ -6056,7 +6125,7 @@
+     fixedMovingAvg: float
+ 
+ const CHECKPOINT_MAGIC = "KLEISMIC_GA_CHECKPOINT"
+-const CHECKPOINT_VERSION = 31
++const CHECKPOINT_VERSION = 32
+ const CHECKPOINT_OBJECTIVE_VERSION = 30 # v30: unbiased equal-case 6x20 objective
+ var migratedRuleCount = false
+ var loadedCheckpointVersion = 0
+@@ -6559,6 +6628,12 @@
+     fs.write(rollingCaseAge[ci].int64)
+   for group in 0 .. 2:
+     fs.write(rollingRefreshCredit[group].int64)
++  # v32: FAST controller state is part of runtime continuity.  It does not
++  # alter the objective, but resetting it on resume caused avoidable speed
++  # regressions and changed screening behavior for several generations.
++  fs.write(adaptiveFastEvalStride.int64)
++  fs.write(adaptiveFastScanWork)
++  fs.write(lastScreeningCorrelation)
+ 
+   let savedMa = maValuesChronological()
+   fs.write(savedMa.len.int64)
+@@ -6631,6 +6706,9 @@
+   maHistory = @[]
+   evalAggsX = @[]
+   evalAggsY = @[]
++  adaptiveFastEvalStride = FAST_EVAL_STRIDE
++  adaptiveFastScanWork = FAST_SCAN_WORK_DEFAULT
++  lastScreeningCorrelation = 0.85
+ 
+   var fs = newFileStream(path, fmRead)
+   if fs.isNil:
+@@ -6642,7 +6720,7 @@
+       raise newException(IOError, "Invalid checkpoint magic: " & path)
+ 
+     let version = int(fs.readInt64())
+-    if version < 3 or (version > 9 and version notin [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 30, CHECKPOINT_VERSION]):
++    if version < 3 or (version > 9 and version notin [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 30, 31, CHECKPOINT_VERSION]):
+       raise newException(IOError, "Unsupported checkpoint version: " & $version)
+ 
+     nextIter = int(fs.readInt64())
+@@ -6683,6 +6761,12 @@
+         rollingCaseAge[ci] = max(0, int(fs.readInt64()))
+       for group in 0 .. 2:
+         rollingRefreshCredit[group] = max(0, int(fs.readInt64()))
++    if version >= 32:
++      adaptiveFastEvalStride = max(FAST_EVAL_STRIDE_MIN,
++        min(FAST_EVAL_STRIDE_MAX, int(fs.readInt64())))
++      adaptiveFastScanWork = max(FAST_SCAN_WORK_MIN,
++        min(FAST_SCAN_WORK_MAX, fs.readInt64()))
++      lastScreeningCorrelation = max(-1.0, min(1.0, fs.readFloat64()))
+ 
+     let maLen64 = fs.readInt64()
+     if maLen64 < 0 or maLen64 > 10_000_000:
+@@ -7794,7 +7878,12 @@
+   ## Cache hits count as logical evaluations as in the previous hill climber;
+   ## actualScoreCalls separately counts expensive scoreRaw invocations.
+   result.id = id
+-  var rng = initRand(int64(generation + 1) * 1_000_003'i64 + int64(id + 1) * 7_919'i64)
++  # Common random numbers: every outer Genome in one Jev round receives the
++  # same stochastic proposal stream. Candidate IDs are strongly correlated with
++  # GA role (elites live near the prefix), so seeding by id injected a permanent
++  # slot-dependent noise source into the Jev ranking. Fitness-dependent
++  # tournaments still make the inner searches diverge naturally after scoring.
++  var rng = initRand(int64(generation + 1) * 1_000_003'i64 + 7_919'i64)
+   template scratch: var EvalScratch = getThreadEvalScratch(g.len)
+   prepareScoreScratch(g, scratch)
+   let generationIndex = generationCandidateIndex(index)
+@@ -7903,20 +7992,14 @@
+           if token != child[at]: child[at] = token
+         for j in countdown(edits - 1, 0):
+           swap(positions[j], positions[swapTargets[j]])
+-      # Avoid spending the budget on copies of the surviving population.
+-      # The repair is bounded; failure falls back to the exact memoized score.
++      # Avoid spending the logical 6400-step budget on any text already scored,
++      # not merely a member of the current 20+20 population. `memo` is the exact
++      # history set already maintained for energy caching, so one hash lookup
++      # replaces up to forty 64-token linear sequence comparisons per offspring.
++      # The repair is bounded; if four nudges still collide, tryEnergy returns the
++      # exact memoized energy and the logical-evaluation accounting remains valid.
+       for _ in 0 ..< 4:
+-        var duplicate = false
+-        for item in next:
+-          if item.suffix == child:
+-            duplicate = true
+-            break
+-        if not duplicate:
+-          for item in innerPop:
+-            if item.suffix == child:
+-              duplicate = true
+-              break
+-        if not duplicate: break
++        if not memo.hasKey(child): break
+         let pos = rand(rng, child.len - 1)
+         let oldToken = child[pos]
+         var token = jevSampleToken(rng, alphabet, cumulative)
+@@ -10285,14 +10368,35 @@
+   let pareto = looseRuntimeParetoPool(@[0, 1, 2, 3],
+     syntheticScores, syntheticTimes)
+   doAssert 0 in pareto and 1 in pareto and 2 notin pareto and 3 notin pareto
+-  var forcedBudget = EvaluationBudget(started: epochTime() - 10.0)
++  # Exercise the wall-clock watchdog independently of the logical-visit guard.
++  # A zero maxRuleVisits would otherwise trip immediately and give false
++  # confidence that the time-budget branch itself was covered.
++  var forcedBudget = EvaluationBudget(
++    started: epochTime() - 10.0,
++    maxRuleVisits: high(int),
++    maxSampleSeconds: 0.001,
++    clockCheckVisits: 1
++  )
+   var caughtBudget = false
+   try:
+-    for i in 0 ..< 1024: checkEvaluationBudget(forcedBudget)
++    checkEvaluationBudget(forcedBudget)
+   except EvaluationBudgetExceeded:
+     caughtBudget = true
+   doAssert caughtBudget
+-  echo "PASS: AAA=1500, loose Pareto champion preservation and budget guard"
++  var forcedVisitBudget = EvaluationBudget(
++    started: epochTime(),
++    maxRuleVisits: 1,
++    maxSampleSeconds: 0.0,
++    clockCheckVisits: high(int)
++  )
++  var caughtVisitBudget = false
++  try:
++    checkEvaluationBudget(forcedVisitBudget)
++    checkEvaluationBudget(forcedVisitBudget)
++  except EvaluationBudgetExceeded:
++    caughtVisitBudget = true
++  doAssert caughtVisitBudget
++  echo "PASS: AAA=1500, loose Pareto champion preservation and independent time/work budget guards"
+   quit(0)
+ 
+ setMaxPoolSize(workerCount)
+@@ -10504,10 +10608,6 @@
+ # checkpointからの再開時も saved stagnation は保持し、baselineだけ再初期化する。
+ var slowEpochBest = -Inf
+ var slowEpochInitialized = false
+-# Screening-control state is runtime-only.  A resume begins conservatively and
+-# relearns the cheap/full correlation within one or two generations.
+-var lastScreeningCorrelation = 0.85
+-
+ var compiledPopulation = newSeq[seq[SeqPattern]](pop_size)
+ # 各ruleのpattern revision。
+ # a の内容が変化したときだけrevisionが更新されるので、
+@@ -10843,13 +10943,15 @@
+   # are never compared across a race boundary.
+   var fastCaseScores = newSeq[seq[float]](pop_size)
+   var fastCaseSeen = newSeq[seq[bool]](pop_size)
++  var fastInvalid = newSeq[bool](pop_size)
+   let fastTotalCases = fastAggsX.len
+   for jp in fastIds:
+     fastCaseScores[jp] = newSeq[float](fastTotalCases)
+     fastCaseSeen[jp] = newSeq[bool](fastTotalCases)
+ 
+   proc fastObservedAggregate(id: int): float =
+-    if id < 0 or id >= fastCaseScores.len or fastCaseScores[id].len == 0:
++    if id < 0 or id >= fastCaseScores.len or fastCaseScores[id].len == 0 or
++       fastInvalid[id]:
+       return -Inf
+     var total = 0.0
+     var weightSum = 0.0
+@@ -10883,32 +10985,53 @@
+     var oneX = @[fastAggsX[caseId]]
+     var oneY = @[fastAggsY[caseId]]
+     var oneRank = @[fastRankedY[caseId]]
++    var stageBudgetFailed: seq[bool]
+     let stageResults = parallelEvaluateCasesBatch(
+       population, compiledPopulation, candidatePopulation, ids,
+       addr oneX, addr oneY, addr oneRank, AAA, FAST_EVAL_ROUNDS, phaseName,
+       nil, addr fastBudgetFailures, FAST_MAX_RULE_VISITS, 0.0, 32768,
+-      fastScanWorkUsed)
++      fastScanWorkUsed, addr stageBudgetFailed)
+     for i, id in ids:
++      if i < stageBudgetFailed.len and stageBudgetFailed[i]:
++        fastInvalid[id] = true
+       if stageResults[i].len > 0:
+         fastCaseScores[id][caseId] = stageResults[i][0]
+         fastCaseSeen[id][caseId] = true
+ 
+   # Base panel is batched so each candidate is spawned only once for its three
+   # cases.  This preserves threadpool efficiency while cutting the tail early.
++  var baseBudgetFailed: seq[bool]
+   let baseResults = parallelEvaluateCasesBatch(
+     population, compiledPopulation, candidatePopulation, fastIds,
+     unsafeAddr screenAggsX, unsafeAddr screenAggsY, unsafeAddr screenRankedY,
+     AAA, FAST_EVAL_ROUNDS, "FAST_RACE_BASE", nil, addr fastBudgetFailures,
+-    FAST_MAX_RULE_VISITS, 0.0, 32768, adaptiveFastScanWork)
++    FAST_MAX_RULE_VISITS, 0.0, 32768, adaptiveFastScanWork,
++    addr baseBudgetFailed)
+   for i, jp in fastIds:
++    if i < baseBudgetFailed.len and baseBudgetFailed[i]:
++      fastInvalid[jp] = true
+     for localCi, actualCi in fastBaseCaseIds:
+       if localCi < baseResults[i].len:
+         fastCaseScores[jp][actualCi] = baseResults[i][localCi]
+         fastCaseSeen[jp][actualCi] = true
+ 
+-  var raceActive = orderFastIds(fastIds)
++  # A scan-work/rule-visit cutoff is a FAST rejection, not a low score inside
++  # the deepest race layer.  Because final ordering is depth-first, merely
++  # assigning -Inf would still put a stage-6 budget failure ahead of every
++  # candidate eliminated at stage 3/4/5.  Quarantine failures explicitly and
++  # append them only after all valid race layers; independent FULL audits remain
++  # the sole path that can rescue a budget-rejected genome.
++  var raceBudgetRejected: seq[int] = @[]
++  var baseValid: seq[int] = @[]
++  for id in fastIds:
++    if fastInvalid[id]: raceBudgetRejected.add(id)
++    else: baseValid.add(id)
++  var raceActive = orderFastIds(baseValid)
+   var raceEliminated: seq[seq[int]] = @[]
+-  var raceStageSizes: seq[int] = @[raceActive.len]
++  # Stage sizes count jobs actually evaluated, including candidates that fail
++  # during that stage, so budget-failure rates and sample counts have the right
++  # denominator.
++  var raceStageSizes: seq[int] = @[fastIds.len]
+   var raceStageCases: seq[int] = @[]
+ 
+   # Cases 4/5/6 go only to progressively smaller pools. High correlation may
+@@ -10923,9 +11046,14 @@
+       raceActive.setLen(keep)
+     let caseId = fastRaceCaseOrder[fastBaseCaseCount + stage]
+     raceStageCases.add(caseId)
++    let evaluatedThisStage = raceActive.len
+     evaluateFastCaseFor(raceActive, caseId, "FAST_RACE_" & $(stage + 2))
+-    raceActive = orderFastIds(raceActive)
+-    raceStageSizes.add(raceActive.len)
++    var stageValid: seq[int] = @[]
++    for id in raceActive:
++      if fastInvalid[id]: raceBudgetRejected.add(id)
++      else: stageValid.add(id)
++    raceActive = orderFastIds(stageValid)
++    raceStageSizes.add(evaluatedThisStage)
+ 
+   # Final race order: deepest survivors first, then reverse elimination layers.
+   # Within each layer all candidates were measured on identical cases.
+@@ -10933,6 +11061,7 @@
+   if raceEliminated.len > 0:
+     for layer in countdown(raceEliminated.high, 0):
+       screeningOrder.add(raceEliminated[layer])
++  screeningOrder.add(raceBudgetRejected)
+ 
+   for jp in fastIds:
+     accs[jp] = fastObservedAggregate(jp)
+@@ -10982,7 +11111,7 @@
+   for actualCi in fastBaseCaseIds:
+     var scores = newSeq[float](fastIds.len)
+     for i, jp in fastIds:
+-      scores[i] = fastCaseScores[jp][actualCi]
++      scores[i] = if fastInvalid[jp]: -Inf else: fastCaseScores[jp][actualCi]
+     let specialists = sortIndicesByScore(scores)
+     for oi in 0 ..< min(SPECIALISTS_PER_CASE, specialists.len):
+       let jp = fastIds[specialists[oi]]
+@@ -11373,7 +11502,10 @@
+   # Stabilize generation time against computational bloat. A budget miss is a
+   # FAST-only viability signal; FULL semantics are unchanged. Independent FULL
+   # audits can widen the cap if that proxy ever starts rejecting good genomes.
+-  var fastBudgetDenom = fastIds.len * fastBaseCaseCount
++  # `exceededCases` is one flag per spawned candidate job.  The base job
++  # contains three cases but increments the counter only once on failure, so a
++  # candidate-case denominator understated the true failure rate by up to 3x.
++  var fastBudgetDenom = fastIds.len
+   if raceStageSizes.len > 1:
+     for stage in 1 ..< raceStageSizes.len:
+       fastBudgetDenom += raceStageSizes[stage]
+@@ -11423,6 +11555,7 @@
+        " race_case_order=", fastRaceCaseOrder,
+        " race_stage_cases=", raceStageCases,
+        " race_stage_sizes=", raceStageSizes,
++       " race_budget_rejected=", raceBudgetRejected.len,
+        " race_pool_targets=", racePoolTargets,
+        " fast_candidate_case_evals=", fastCandidateCaseEvals,
+        " fast_sample_evals=", fastSampleEvals,
+@@ -11430,6 +11563,7 @@
+        " fast_scan_work_used=", fastScanWorkUsed,
+        " fast_scan_work_next=", adaptiveFastScanWork,
+        " fast_budget_failures=", fastBudgetFailures,
++       " fast_budget_invalid_candidates=", fastInvalid.countIt(it),
+        " fast_budget_failure_rate=", formatFloat(fastBudgetFailureRate, ffDecimal, 4),
+        " fast_points_per_case=", fastPointsSummary,
+        " audit_due=", auditDue,
+@@ -12476,6 +12610,8 @@
+   let tGenEnd = epochTime()
+   echo "  work_counts: pattern_revision_updates=", patternRevisionUpdates,
+        " candidate_index_rebuilds=", candidateIndexRebuilds,
++       " pattern_cache_entries=", patternCache.len,
++       " revision_cache_entries=", revisionPatternCache.len,
+        " trace_builds=", traceBuilds,
+        " trace_seconds=", formatFloat(traceSeconds, ffDecimal, 4)
+   # ★追加: tGenStartはこれまで取得されているだけで一切出力されて

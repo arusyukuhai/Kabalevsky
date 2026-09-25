@@ -1,0 +1,364 @@
+--- /mnt/data/at_jev_v33_jev_fusion.nim	2026-09-25 09:32:17.230676879 +0000
++++ at_jev.nim	2026-09-25 09:54:01.187205476 +0000
+@@ -33,6 +33,9 @@
+ #      fresh/stale influence separation, 8-slot bounded survival, due-only
+ #      nursery reservoir, stable 64-model cohort lanes, repeat-free Jev metric,
+ #      fixed-range G/J Pareto normalization, and MA10 progress.
++# v34: runtime-bloat guard for FAST: deterministic scan-work budgets, adaptive
++#      stride up to 5, correlation-sized race pools, and stronger near-tie
++#      runtime Pareto pressure. FULL objective/rounds remain unchanged.
+ # Audit: bounded parent pools, exact-duplicate rescue, cached distance minima.
+ # Build: nim c -d:release --threads:on at.nim
+ # Verify: ./at --regression-test && ./at --self-test
+@@ -3833,6 +3836,10 @@
+     maxRuleVisits: int
+     maxSampleSeconds: float
+     clockCheckVisits: int
++    # Deterministic proxy for the expensive hot path: every candidate rule
++    # scans the current state. FULL leaves this unlimited; FAST may cap it.
++    scanWork: int64
++    maxScanWork: int64
+ 
+ const
+   EVAL_MAX_RULE_VISITS = 1_500_000
+@@ -3870,6 +3877,16 @@
+       raise newException(EvaluationBudgetExceeded,
+         "single-trajectory evaluation exceeded its per-sample time budget")
+ 
++proc chargeEvaluationScanWork(budget: var EvaluationBudget, stateLen: int) {.inline, gcsafe.} =
++  ## `replaceSeqCompiledInto` is roughly proportional to the state scanned.
++  ## Counting this logical work (rather than wall-clock time) gives FAST a
++  ## deterministic anti-bloat cutoff that is stable across core counts.
++  if budget.maxScanWork <= 0: return
++  budget.scanWork += int64(max(1, stateLen))
++  if budget.scanWork > budget.maxScanWork:
++    raise newException(EvaluationBudgetExceeded,
++      "single-trajectory evaluation exceeded its FAST scan-work budget")
++
+ proc scoreRaw(
+   genome: Genome,
+   compiled: seq[SeqPattern],
+@@ -3882,7 +3899,8 @@
+   featureCoefficients: ptr seq[float] = nil,
+   maxRuleVisits: int = EVAL_MAX_RULE_VISITS,
+   maxSampleSeconds: float = EVAL_MAX_SAMPLE_SECONDS,
+-  clockCheckVisits: int = EVAL_CLOCK_CHECK_VISITS
++  clockCheckVisits: int = EVAL_CLOCK_CHECK_VISITS,
++  maxScanWork: int64 = 0
+ ): float {.gcsafe.} =
+   ## One text, sequential rules, no parallel state or original-worldline.
+   ## Each successful match earns its signed rule weight even if unchanged.
+@@ -3912,10 +3930,12 @@
+     copyMem(addr state[0], unsafeAddr input[0], input.len * sizeof(int))
+   defer: evalScratch.bufA = move(state)
+   var budget = EvaluationBudget(
+-    started: epochTime(),
++    started: (if maxSampleSeconds > 0.0: epochTime() else: 0.0),
+     maxRuleVisits: max(1, maxRuleVisits),
+     maxSampleSeconds: maxSampleSeconds,
+-    clockCheckVisits: max(1, clockCheckVisits)
++    clockCheckVisits: max(1, clockCheckVisits),
++    scanWork: 0'i64,
++    maxScanWork: maxScanWork
+   )
+   let needFeatures = recordCredit or featureCoefficients != nil
+   var roundFeatures: seq[float] = @[]
+@@ -3968,6 +3988,7 @@
+         continue
+       var replacementOverflow = false
+       var matched = false
++      chargeEvaluationScanWork(budget, state.len)
+       try:
+         matched = replaceSeqCompiledInto(state, compiled[k], genome[k].b,
+           evalScratch.bufB, evalScratch.replaceScratch,
+@@ -4031,7 +4052,11 @@
+   aggsX: seq[seq[int]],
+   rankedY: seq[float],
+   evalScratch: var EvalScratch,
+-  maxRounds: int = SCORE_ROUNDS
++  maxRounds: int = SCORE_ROUNDS,
++  maxRuleVisits: int = EVAL_MAX_RULE_VISITS,
++  maxSampleSeconds: float = EVAL_MAX_SAMPLE_SECONDS,
++  clockCheckVisits: int = EVAL_CLOCK_CHECK_VISITS,
++  maxScanWork: int64 = 0
+ ): float {.gcsafe.} =
+   evalScratch.outYs.setLen(0)
+   # The rolling trajectories are deliberately damage-distinct.  A per-genome
+@@ -4042,7 +4067,9 @@
+   for sampleId, input in aggsX:
+     var value: float
+     try:
+-      value = scoreRaw(genome, compiled, candidates, input, evalScratch, maxRounds)
++      value = scoreRaw(genome, compiled, candidates, input, evalScratch, maxRounds,
++        false, nil, nil, maxRuleVisits, maxSampleSeconds, clockCheckVisits,
++        maxScanWork)
+     except EvaluationBudgetExceeded:
+       raise
+     except CatchableError as e:
+@@ -4145,7 +4172,11 @@
+   ruleCount: int,
+   maxRounds: int = SCORE_ROUNDS,
+   caseTimings: ptr seq[float] = nil,
+-  exceededCases: ptr int = nil
++  exceededCases: ptr int = nil,
++  maxRuleVisits: int = EVAL_MAX_RULE_VISITS,
++  maxSampleSeconds: float = EVAL_MAX_SAMPLE_SECONDS,
++  clockCheckVisits: int = EVAL_CLOCK_CHECK_VISITS,
++  maxScanWork: int64 = 0
+ ): seq[float] {.gcsafe.} =
+   ## 各chunkを独立した「case」として返す。
+   ## 平均を1本だけ返す旧APIとは別に、選抜時のBatch Tournament /
+@@ -4172,7 +4203,8 @@
+       result[chunkId] = evaluateChunk(
+         genome, compiled, candidates,
+         chunksX[][chunkId], rankedYs[][chunkId],
+-        evalScratch, maxRounds
++        evalScratch, maxRounds, maxRuleVisits, maxSampleSeconds,
++        clockCheckVisits, maxScanWork
+       )
+     except EvaluationBudgetExceeded:
+       # Invalidate the WHOLE genome evaluation, not one observation's raw
+@@ -4199,8 +4231,8 @@
+ const
+   PARETO_FITNESS_SLACK = 0.012
+   PARETO_FITNESS_NOISE = 0.002
+-  PARETO_TIME_ADVANTAGE = 1.6
+-  PARETO_PARENT_PERCENT = 30
++  PARETO_TIME_ADVANTAGE = 1.40
++  PARETO_PARENT_PERCENT = 40
+ 
+ proc looseRuntimeParetoPool(
+   ids: openArray[int], fitness, seconds: openArray[float]
+@@ -4318,12 +4350,17 @@
+   ruleCount: int,
+   maxRounds: int = SCORE_ROUNDS,
+   caseTimings: ptr seq[float] = nil,
+-  exceededCases: ptr int = nil
++  exceededCases: ptr int = nil,
++  maxRuleVisits: int = EVAL_MAX_RULE_VISITS,
++  maxSampleSeconds: float = EVAL_MAX_SAMPLE_SECONDS,
++  clockCheckVisits: int = EVAL_CLOCK_CHECK_VISITS,
++  maxScanWork: int64 = 0
+ ): seq[float] {.gcsafe.} =
+   try:
+     result = evaluateIndividualCases(
+       genome, compiled, candidates, chunksX, chunksY, rankedYs, ruleCount,
+-      maxRounds, caseTimings, exceededCases
++      maxRounds, caseTimings, exceededCases, maxRuleVisits, maxSampleSeconds,
++      clockCheckVisits, maxScanWork
+     )
+     if result.len == 0 or result.len != min(chunksX[].len, chunksY[].len):
+       raise newException(SeqReplaceError, "evaluation returned missing case scores")
+@@ -5084,7 +5121,11 @@
+   chunksY: ptr seq[seq[int]],
+   rankedYs: ptr seq[seq[float]],
+   ruleCount: int,
+-  maxRounds: int
++  maxRounds: int,
++  maxRuleVisits: int = EVAL_MAX_RULE_VISITS,
++  maxSampleSeconds: float = EVAL_MAX_SAMPLE_SECONDS,
++  clockCheckVisits: int = EVAL_CLOCK_CHECK_VISITS,
++  maxScanWork: int64 = 0
+ ): CaseEvaluationOutcome {.gcsafe.} =
+   # Return failures as data only so ALL FlowVars can be drained before the
+   # main thread raises; otherwise other workers might outlive stack pointers.
+@@ -5094,7 +5135,8 @@
+       compiledPopulation[][id],
+       candidatePopulation[][id],
+       chunksX, chunksY, rankedYs, ruleCount, maxRounds,
+-      addr result.caseTimings, addr result.exceededCases
++      addr result.caseTimings, addr result.exceededCases,
++      maxRuleVisits, maxSampleSeconds, clockCheckVisits, maxScanWork
+     )
+   except CatchableError as e:
+     result.error = "CatchableError: " & e.msg & "\n" & getStackTrace(e)
+@@ -5153,7 +5195,12 @@
+   ruleCount: int,
+   maxRounds: int,
+   phase: string = "FULL",
+-  measuredTimings: ptr seq[seq[float]] = nil
++  measuredTimings: ptr seq[seq[float]] = nil,
++  budgetFailures: ptr int = nil,
++  maxRuleVisits: int = EVAL_MAX_RULE_VISITS,
++  maxSampleSeconds: float = EVAL_MAX_SAMPLE_SECONDS,
++  clockCheckVisits: int = EVAL_CLOCK_CHECK_VISITS,
++  maxScanWork: int64 = 0
+ ): seq[seq[float]] {.gcsafe.} =
+   result = newSeq[seq[float]](ids.len)
+   if measuredTimings != nil:
+@@ -5171,7 +5218,8 @@
+     let id = ids[j]
+     jobs[j] = spawn safeEvaluateIndividualCasesById(
+       populationPtr, compiledPopulationPtr, candidatePopulationPtr, id,
+-      chunksX, chunksY, rankedYs, ruleCount, maxRounds
++      chunksX, chunksY, rankedYs, ruleCount, maxRounds, maxRuleVisits,
++      maxSampleSeconds, clockCheckVisits, maxScanWork
+     )
+   var firstFailure = ""
+   var totalBudgetFailures = 0
+@@ -5188,6 +5236,8 @@
+       result[j] = outcome.scores
+       if measuredTimings != nil:
+         measuredTimings[][j] = outcome.caseTimings
++  if budgetFailures != nil:
++    budgetFailures[] += totalBudgetFailures
+   if totalBudgetFailures > 0:
+     echo "  evaluation_budget: phase=", phase,
+          " invalidated_genomes=", totalBudgetFailures,
+@@ -5449,10 +5499,19 @@
+ # that are going to be rejected anyway.  v31 never falls back to the old
+ # stride=2 (11 points/case) unless explicitly changed here; stride 3 already
+ # gives about eight points on a 20-point trajectory and is materially cheaper.
+-const FAST_EVAL_STRIDE = 3
++const FAST_EVAL_STRIDE = 4
+ const FAST_EVAL_STRIDE_MIN = 3
+-const FAST_EVAL_STRIDE_MAX = 4
++const FAST_EVAL_STRIDE_MAX = 5
+ var adaptiveFastEvalStride = FAST_EVAL_STRIDE
++# FAST must not let computationally bloated offspring dominate generation time.
++# FULL keeps the original unlimited scan-work semantics. The FAST cap is a
++# deterministic proxy for actual replacement scanning and adapts from audit
++# evidence instead of truncating temporal rounds.
++const FAST_SCAN_WORK_DEFAULT = 40_000_000'i64
++const FAST_SCAN_WORK_MIN = 20_000_000'i64
++const FAST_SCAN_WORK_MAX = 160_000_000'i64
++const FAST_MAX_RULE_VISITS = 600_000
++var adaptiveFastScanWork = FAST_SCAN_WORK_DEFAULT
+ # Sequential race: every optional offspring first sees exactly one case from each
+ # FAST/MEDIUM/SLOW timescale.  Only contenders receive the remaining cases.
+ # The final race pool is >= FULL_EVAL_TOP_MAX, so every merit FULL candidate can
+@@ -5461,6 +5520,17 @@
+ const FAST_RACE_STAGE2_POOL = 128
+ const FAST_RACE_STAGE3_POOL = 72
+ const FAST_RACE_STAGE4_POOL = 48
++
++proc adaptiveRacePoolTargets(correlation: float): array[3, int] {.inline.} =
++  ## At high observed FAST/FULL agreement, spend deep-case work only near the
++  ## actual FULL promotion boundary. Recovery keeps the original wider race.
++  if correlation >= 0.985:
++    [96, 56, 40]
++  elif correlation >= 0.94:
++    [112, 64, 44]
++  else:
++    [FAST_RACE_STAGE2_POOL, FAST_RACE_STAGE3_POOL, FAST_RACE_STAGE4_POOL]
++
+ const FAST_AUDIT_INTERVAL = 4
+ const FAST_AUDIT_COUNT_NORMAL = 4
+ const FAST_AUDIT_COUNT_RECOVERY = 8
+@@ -8382,10 +8452,12 @@
+       copyMem(addr state[0], unsafeAddr input[0], input.len * sizeof(int))
+     defer: evalScratch.bufA = move(state)
+     var budget = EvaluationBudget(
+-      started: epochTime(),
++      started: (if maxSampleSeconds > 0.0: epochTime() else: 0.0),
+       maxRuleVisits: max(1, maxRuleVisits),
+       maxSampleSeconds: maxSampleSeconds,
+-      clockCheckVisits: max(1, clockCheckVisits)
++      clockCheckVisits: max(1, clockCheckVisits),
++      scanWork: 0'i64,
++      maxScanWork: 0'i64
+     )
+     let needFeatures = recordCredit or featureCoefficients != nil
+     var roundFeatures: seq[float] = @[]
+@@ -10803,6 +10875,9 @@
+     for i, pos in localOrder:
+       result[i] = ids[pos]
+ 
++  let fastScanWorkUsed = adaptiveFastScanWork
++  var fastBudgetFailures = 0
++
+   proc evaluateFastCaseFor(ids: seq[int], caseId: int, phaseName: string) =
+     if ids.len == 0 or caseId < 0 or caseId >= fastTotalCases: return
+     var oneX = @[fastAggsX[caseId]]
+@@ -10810,7 +10885,9 @@
+     var oneRank = @[fastRankedY[caseId]]
+     let stageResults = parallelEvaluateCasesBatch(
+       population, compiledPopulation, candidatePopulation, ids,
+-      addr oneX, addr oneY, addr oneRank, AAA, FAST_EVAL_ROUNDS, phaseName)
++      addr oneX, addr oneY, addr oneRank, AAA, FAST_EVAL_ROUNDS, phaseName,
++      nil, addr fastBudgetFailures, FAST_MAX_RULE_VISITS, 0.0, 32768,
++      fastScanWorkUsed)
+     for i, id in ids:
+       if stageResults[i].len > 0:
+         fastCaseScores[id][caseId] = stageResults[i][0]
+@@ -10821,7 +10898,8 @@
+   let baseResults = parallelEvaluateCasesBatch(
+     population, compiledPopulation, candidatePopulation, fastIds,
+     unsafeAddr screenAggsX, unsafeAddr screenAggsY, unsafeAddr screenRankedY,
+-    AAA, FAST_EVAL_ROUNDS, "FAST_RACE_BASE")
++    AAA, FAST_EVAL_ROUNDS, "FAST_RACE_BASE", nil, addr fastBudgetFailures,
++    FAST_MAX_RULE_VISITS, 0.0, 32768, adaptiveFastScanWork)
+   for i, jp in fastIds:
+     for localCi, actualCi in fastBaseCaseIds:
+       if localCi < baseResults[i].len:
+@@ -10833,10 +10911,10 @@
+   var raceStageSizes: seq[int] = @[raceActive.len]
+   var raceStageCases: seq[int] = @[]
+ 
+-  # Cases 4/5/6 go only to progressively smaller pools.  The final pool is 48,
+-  # matching FULL_EVAL_TOP_MAX, so every merit promotion is fully screened.
+-  let racePoolTargets = [FAST_RACE_STAGE2_POOL, FAST_RACE_STAGE3_POOL,
+-                         FAST_RACE_STAGE4_POOL]
++  # Cases 4/5/6 go only to progressively smaller pools. High correlation may
++  # shrink the deepest pool to 40 because the merit target is then 36; recovery
++  # restores 48 whenever screening agreement deteriorates.
++  let racePoolTargets = adaptiveRacePoolTargets(lastScreeningCorrelation)
+   for stage in 0 ..< min(3, max(0, fastRaceCaseOrder.len - fastBaseCaseCount)):
+     let keep = min(racePoolTargets[stage], raceActive.len)
+     if keep <= 0: break
+@@ -11282,16 +11360,36 @@
+   # than by evaluating every candidate on an adaptive global case count.
+   # Reliability feedback therefore changes observation stride; independent
+   # audits still trigger denser sampling when the race becomes unsafe.
+-  # Observation density is the secondary knob.  Never return to stride=2: on
+-  # this 20-point objective it nearly doubles FAST work for little measured
+-  # ranking benefit.  Only use stride=4 after very strong paired agreement.
++  # Observation density is the secondary knob. Never return to stride=2.
++  # With very strong audited agreement, stride=5 leaves 5-6 rank points/case
++  # while FULL still uses all 20 points. Any evidence of misses restores density.
+   if severeAuditMiss or screeningCorr < 0.76:
+     adaptiveFastEvalStride = FAST_EVAL_STRIDE_MIN
+-  elif screeningCorr > 0.97 and auditMissedMerit == 0:
++  elif screeningCorr > 0.985 and auditMissedMerit == 0:
+     adaptiveFastEvalStride = min(FAST_EVAL_STRIDE_MAX, adaptiveFastEvalStride + 1)
+   elif screeningCorr < 0.90:
+     adaptiveFastEvalStride = max(FAST_EVAL_STRIDE_MIN, adaptiveFastEvalStride - 1)
+ 
++  # Stabilize generation time against computational bloat. A budget miss is a
++  # FAST-only viability signal; FULL semantics are unchanged. Independent FULL
++  # audits can widen the cap if that proxy ever starts rejecting good genomes.
++  var fastBudgetDenom = fastIds.len * fastBaseCaseCount
++  if raceStageSizes.len > 1:
++    for stage in 1 ..< raceStageSizes.len:
++      fastBudgetDenom += raceStageSizes[stage]
++  fastBudgetDenom = max(1, fastBudgetDenom)
++  let fastBudgetFailureRate = float(fastBudgetFailures) / float(fastBudgetDenom)
++  if severeAuditMiss or screeningCorr < 0.88:
++    adaptiveFastScanWork = min(FAST_SCAN_WORK_MAX,
++      max(adaptiveFastScanWork + 1, (adaptiveFastScanWork * 3) div 2))
++  elif fastBudgetFailureRate > 0.08:
++    adaptiveFastScanWork = min(FAST_SCAN_WORK_MAX,
++      max(adaptiveFastScanWork + 1, (adaptiveFastScanWork * 5) div 4))
++  elif screeningCorr > 0.985 and auditMissedMerit == 0 and
++       fastBudgetFailureRate < 0.02:
++    adaptiveFastScanWork = max(FAST_SCAN_WORK_MIN,
++      (adaptiveFastScanWork * 9) div 10)
++
+   if adaptiveFastEvalStride != previousFastStride:
+     let nextFast = buildFastEvalDataset(evalAggsX, evalAggsY, adaptiveFastEvalStride, fastPhase)
+     fastAggsX = nextFast.x
+@@ -11325,9 +11423,14 @@
+        " race_case_order=", fastRaceCaseOrder,
+        " race_stage_cases=", raceStageCases,
+        " race_stage_sizes=", raceStageSizes,
++       " race_pool_targets=", racePoolTargets,
+        " fast_candidate_case_evals=", fastCandidateCaseEvals,
+        " fast_sample_evals=", fastSampleEvals,
+        " fast_stride_next=", adaptiveFastEvalStride,
++       " fast_scan_work_used=", fastScanWorkUsed,
++       " fast_scan_work_next=", adaptiveFastScanWork,
++       " fast_budget_failures=", fastBudgetFailures,
++       " fast_budget_failure_rate=", formatFloat(fastBudgetFailureRate, ffDecimal, 4),
+        " fast_points_per_case=", fastPointsSummary,
+        " audit_due=", auditDue,
+        " merit_full_target=", requestedFullTop,

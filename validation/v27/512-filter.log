@@ -1,0 +1,1 @@
+PASS: 4000 randomized filter comparisons (length 0..2048, signed/OOV), 100 full-space reversible mappings, upper-half reachability, all 16 captures, bounds/OOV/rounding, 2000 mutation trials, crossover immutability, V10/V12 roundtrips, real offspring novelty

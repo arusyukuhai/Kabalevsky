@@ -1,0 +1,6 @@
+command line(1, 2) Warning: `gc:option` is deprecated; use `mm:option` instead [Deprecated]
+command line(1, 2) Warning: `gc:option` is deprecated; use `mm:option` instead [Deprecated]
+/workspace/scratch/8e70b9ebac20/optimized256/at_jev.nim(31, 11) Warning: use the nimble packages `malebolgia`, `taskpools` or `weave` instead; threadpool is deprecated [Deprecated]
+/workspace/scratch/8e70b9ebac20/optimized256/at_jev.nim(2292, 7) Warning: use `delete(s, first..last)`; delete is deprecated [Deprecated]
+/workspace/scratch/8e70b9ebac20/optimized256/at_jev.nim(2300, 7) Warning: use `delete(s, first..last)`; delete is deprecated [Deprecated]
+/workspace/scratch/8e70b9ebac20/optimized256/at_jev.nim(2313, 9) Warning: use `delete(s, first..last)`; delete is deprecated [Deprecated]

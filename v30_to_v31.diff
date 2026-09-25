@@ -1,0 +1,395 @@
+--- at_jev_v30_backup.nim	2026-09-25 08:37:12.528538472 +0000
++++ at_jev.nim	2026-09-25 08:42:33.520599435 +0000
+@@ -26,6 +26,7 @@
+ # v30: unbiased equal-case objective, exact 6x20 hard-negative replacement,
+ #      slow-only stagnation epochs, matched crossover experiments, and exact
+ #      rolling scheduler state across checkpoint resume.
++# v31: adaptive partial-case FAST screening, sparse audits/probes, cheaper hot path.
+ # Audit: bounded parent pools, exact-duplicate rescue, cached distance minima.
+ # Build: nim c -d:release --threads:on at.nim
+ # Verify: ./at --regression-test && ./at --self-test
+@@ -4009,32 +4010,28 @@
+   maxRounds: int = SCORE_ROUNDS
+ ): float {.gcsafe.} =
+   evalScratch.outYs.setLen(0)
+-  # Exact keys: hash collisions are resolved by sequence equality.
+-  # No approximation or cross-genome reuse; retain duplicate rank observations.
+-  var memo = initTable[seq[int], float]()
++  # The rolling trajectories are deliberately damage-distinct.  A per-genome
++  # Table[seq[int],float] therefore paid two full sequence hashes for almost
++  # every observation and almost never hit.  Re-evaluating an accidental exact
++  # duplicate is semantically identical and cheaper than hashing every normal
++  # sample, so the hot path now stays allocation/hash free.
+   for sampleId, input in aggsX:
+     var value: float
+-    if memo.hasKey(input):
+-      value = memo[input]
+-    else:
+-      try:
+-        value = scoreRaw(genome, compiled, candidates, input, evalScratch, maxRounds)
+-      except EvaluationBudgetExceeded:
+-        # Preserve the existing whole-genome invalidation policy for budgets.
+-        # Only unexpected failures get diagnostic context.
+-        raise
+-      except CatchableError as e:
+-        raise newException(SeqReplaceError,
+-          "evaluation sample failure: sample=" & $sampleId & " input bytes=" & $input.len &
+-          " embedded tokens=" & $(input.len *
+-            (if genome.len > 0 and genome[0].embedding.len == EMBEDDING_ENTRY_COUNT:
+-              EMBEDDING_WIDTH
+-            else: 1)) & "\n" & e.msg)
+-      except Defect as e:
+-        raise newException(SeqReplaceError,
+-          "evaluation sample defect: sample=" & $sampleId & " input bytes=" & $input.len &
+-          "\n" & e.msg & "\n" & getStackTrace(e))
+-      memo[input] = value
++    try:
++      value = scoreRaw(genome, compiled, candidates, input, evalScratch, maxRounds)
++    except EvaluationBudgetExceeded:
++      raise
++    except CatchableError as e:
++      raise newException(SeqReplaceError,
++        "evaluation sample failure: sample=" & $sampleId & " input bytes=" & $input.len &
++        " embedded tokens=" & $(input.len *
++          (if genome.len > 0 and genome[0].embedding.len == EMBEDDING_ENTRY_COUNT:
++            EMBEDDING_WIDTH
++          else: 1)) & "\n" & e.msg)
++    except Defect as e:
++      raise newException(SeqReplaceError,
++        "evaluation sample defect: sample=" & $sampleId & " input bytes=" & $input.len &
++        "\n" & e.msg & "\n" & getStackTrace(e))
+     evalScratch.outYs.add(value)
+   if evalScratch.outYs.len < 2:
+     return 0.0
+@@ -4797,6 +4794,44 @@
+       result.x.add(cx)
+       result.y.add(cy)
+ 
++proc selectFastCaseIndices(totalCases, wanted, phase: int): seq[int] =
++  ## FAST does not need to estimate all six cases for every rejected child.
++  ## With the standard 6-case layout, always include one case from each
++  ## FAST/MEDIUM/SLOW pair, alternate the member every generation, then add
++  ## extra cases cyclically when screening uncertainty asks for them.
++  if totalCases <= 0 or wanted <= 0:
++    return @[]
++  let target = min(totalCases, max(1, wanted))
++  var used = newSeq[bool](totalCases)
++  if totalCases >= 6:
++    # Rolling groups are interleaved by caseId mod 3: {0,3}, {1,4}, {2,5}.
++    # Pick exactly one member of every timescale before adding extras.
++    let groups = min(3, totalCases div 2)
++    for g in 0 ..< groups:
++      let idx = g + (((phase + g) mod 2) * groups)
++      if idx < totalCases and not used[idx]:
++        used[idx] = true
++        result.add(idx)
++  var offset = 0
++  while result.len < target and offset < totalCases * 2:
++    let idx = ((phase + offset) mod totalCases + totalCases) mod totalCases
++    if not used[idx]:
++      used[idx] = true
++      result.add(idx)
++    inc offset
++
++proc subsetFastEvalDataset(
++  srcX: seq[seq[seq[int]]],
++  srcY: seq[seq[int]],
++  srcRankedY: seq[seq[float]],
++  caseIds: openArray[int]
++): tuple[x: seq[seq[seq[int]]], y: seq[seq[int]], rankedY: seq[seq[float]]] =
++  for ci in caseIds:
++    if ci >= 0 and ci < srcX.len and ci < srcY.len and ci < srcRankedY.len:
++      result.x.add(srcX[ci])
++      result.y.add(srcY[ci])
++      result.rankedY.add(srcRankedY[ci])
++
+ # ONE-ROUND linear response for fixed a/b. Multi-round
+ # 2-gram termination depends on weights, so never use this cache for FULL
+ # selection or local search. Kept solely for the explicit one-round test.
+@@ -5384,25 +5419,35 @@
+ 
+ # 粗密二段階評価。全個体を薄いサンプルで一次選抜し、
+ # 上位だけ完全評価する。個体数が増えても計算量が素直に増えにくい。
+-# FAST sample thinning. Higher stride = fewer observations = faster screening.
+-# On a 20-point case, stride 3 keeps about eight rank points and stride 2 keeps
+-# about eleven. Temporal execution itself is never truncated.
++# FAST is only a screening surrogate: FULL always remains 6 x 20.  Keep the
++# temporal program exact, but spend far fewer observations/cases on candidates
++# that are going to be rejected anyway.  v31 never falls back to the old
++# stride=2 (11 points/case) unless explicitly changed here; stride 3 already
++# gives about eight points on a 20-point trajectory and is materially cheaper.
+ const FAST_EVAL_STRIDE = 3
+-const FAST_EVAL_STRIDE_MIN = 2
+-const FAST_EVAL_STRIDE_MAX = 3
++const FAST_EVAL_STRIDE_MIN = 3
++const FAST_EVAL_STRIDE_MAX = 4
+ var adaptiveFastEvalStride = FAST_EVAL_STRIDE
++const FAST_CASE_COUNT_MIN = 3
++const FAST_CASE_COUNT_MAX = 6
++var adaptiveFastCaseCount = FAST_CASE_COUNT_MIN
++const FAST_AUDIT_INTERVAL = 4
++const FAST_AUDIT_COUNT_NORMAL = 4
++const FAST_AUDIT_COUNT_RECOVERY = 8
+ const FULL_EVAL_TOP = 42
++const FULL_EVAL_TOP_MIN = 36
++const FULL_EVAL_TOP_MAX = 48
+ # FAST differs from FULL only in sampled observations.  Truncating temporal
+ # execution changes the phenotype of an iterative replacement program, so both
+ # tiers must run the same natural sqrt(input)-bounded evaluator.
+ const FAST_EVAL_ROUNDS = SCORE_ROUNDS
+-const ADAPTIVE_FULL_EXTRA_MAX = 8
++const ADAPTIVE_FULL_EXTRA_MAX = 6
+ # FULL評価は上位だけに閉じず、親候補の遺伝的多様性を確保するため
+ # 毎世代ランダムな個体も追加で完全評価する。
+ const FULL_EVAL_DIVERSITY_EXTRA = 8
+ # Uniform audit of candidates excluded by FAST/merit/diversity.
+ # FULL-evaluated audit candidates are eligible parents, not discarded probes.
+-const FAST_REJECT_AUDIT_COUNT = 8
++const FAST_REJECT_AUDIT_COUNT = FAST_AUDIT_COUNT_RECOVERY
+ const FAST_AUDIT_MISS_MARGIN = 0.005
+ # A single small merit miss is noisy evidence. Only a best miss, repeated merit
+ # misses, or a clearly large margin should force a denser FAST dataset.
+@@ -5422,7 +5467,7 @@
+ const ASEXUAL_BASE_PERCENT = 55
+ const ASEXUAL_STAGNATION_REDUCTION = 20
+ const CROSSOVER_MUTATION_PERCENT = 55
+-const CROSSOVER_TRACE_SAMPLE_COUNT = 12
++const CROSSOVER_TRACE_SAMPLE_COUNT = 6
+ 
+ proc localMutationCap(stagnation: int): int {.inline.} =
+   ## Smoothly widen only the local lane as a plateau persists. Even at maximum
+@@ -10302,13 +10347,16 @@
+   eliteOfElites.setLen(0)
+ 
+ echo "evaluation mode: parallel individual evaluation (--threads:on)"
+-echo "rolling evaluation: 6 cases x 20 points; per-case lifetime fast=8, medium=16, slow=32; one case refresh max/generation"
++echo "rolling evaluation: FULL=6 cases x 20 points; FAST starts with 3 rotating cases x ~8 points; exact temporal rounds"
+ 
+ # stagnation判定は、32世代だけ保持されるslow rolling case上の改善で測る。
+ # case交換そのものを「悪化」扱いしないため、slow case交換直後はbaselineだけ張り直す。
+ # checkpointからの再開時も saved stagnation は保持し、baselineだけ再初期化する。
+ var slowEpochBest = -Inf
+ var slowEpochInitialized = false
++# Screening-control state is runtime-only.  A resume begins conservatively and
++# relearns the cheap/full correlation within one or two generations.
++var lastScreeningCorrelation = 0.85
+ 
+ var compiledPopulation = newSeq[seq[SeqPattern]](pop_size)
+ # 各ruleのpattern revision。
+@@ -10343,7 +10391,9 @@
+ 
+ var mutationSuccessEma = 0.20
+ var feedbackMutationScale = 1.0
+-const MUTATION_PROBE_COUNT = 6
++const MUTATION_PROBE_COUNT = 4
++const MUTATION_PROBE_INTERVAL = 2
++const CROSSOVER_PROBE_INTERVAL = 4
+ 
+ # Keep Jev metric files tied to their checkpoint, not to a shared CWD filename.
+ jevProgressPath = checkpointPath & ".jev_progress.csv"
+@@ -10524,6 +10574,13 @@
+   fastAggsX = phasedFast.x
+   fastAggsY = phasedFast.y
+   fastRankedY = buildRankedY(fastAggsY)
++  let fastCaseIndices = selectFastCaseIndices(fastAggsX.len,
++    adaptiveFastCaseCount, iter)
++  let fastSubset = subsetFastEvalDataset(fastAggsX, fastAggsY,
++    fastRankedY, fastCaseIndices)
++  let screenAggsX = fastSubset.x
++  let screenAggsY = fastSubset.y
++  let screenRankedY = fastSubset.rankedY
+ 
+   if iter > 0 and iter mod CACHE_CLEAR_INTERVAL == 0:
+     # 100世代ごとの全消去は再コンパイルを大量発生させ、
+@@ -10627,9 +10684,9 @@
+     compiledPopulation,
+     candidatePopulation,
+     fastIds,
+-    unsafeAddr fastAggsX,
+-    unsafeAddr fastAggsY,
+-    unsafeAddr fastRankedY,
++    unsafeAddr screenAggsX,
++    unsafeAddr screenAggsY,
++    unsafeAddr screenRankedY,
+     AAA,
+     FAST_EVAL_ROUNDS,
+     "FAST"
+@@ -10653,7 +10710,12 @@
+   # Protected survivors/archive entries are already paid incumbents; they must
+   # not subtract from the number of NEW offspring that receive a proper FULL
+   # merit evaluation.  Keep a stable innovation bandwidth every generation.
+-  let fullCount = min(FULL_EVAL_TOP, screeningOrder.len)
++  let requestedFullTop =
++    if iter - startIter < 2: FULL_EVAL_TOP
++    elif lastScreeningCorrelation >= 0.92: FULL_EVAL_TOP_MIN
++    elif lastScreeningCorrelation < 0.72: FULL_EVAL_TOP_MAX
++    else: FULL_EVAL_TOP
++  let fullCount = min(requestedFullTop, screeningOrder.len)
+ 
+   # ------------------------------------------------------------
+   # ★重要: elitism を FAST 評価に依存させない。
+@@ -10680,7 +10742,7 @@
+   # Rescue case specialists hidden by mean-only screening. Their true FULL
+   # scores, never their FAST estimates, still determine survival and parenthood.
+   const SPECIALISTS_PER_CASE = 1
+-  for ci in 0 ..< fastAggsX.len:
++  for ci in 0 ..< screenAggsX.len:
+     var scores = newSeq[float](fastIds.len)
+     for i, jp in fastIds:
+       scores[i] = fastCaseScores[jp][ci]
+@@ -10941,8 +11003,14 @@
+   let auditPopulation = auditCandidates.len
+   shuffle(auditCandidates)
+   var auditIds: seq[int] = @[]
+-  for i in 0 ..< min(FAST_REJECT_AUDIT_COUNT, auditCandidates.len):
+-    auditIds.add(auditCandidates[i])
++  let auditDue = (iter mod FAST_AUDIT_INTERVAL == 0) or
++                 lastScreeningCorrelation < 0.82
++  let requestedAuditCount =
++    if lastScreeningCorrelation < 0.82: FAST_AUDIT_COUNT_RECOVERY
++    else: FAST_AUDIT_COUNT_NORMAL
++  if auditDue:
++    for i in 0 ..< min(requestedAuditCount, auditCandidates.len):
++      auditIds.add(auditCandidates[i])
+ 
+   var auditMissedMerit = 0
+   var auditMissedBest = 0
+@@ -10984,7 +11052,11 @@
+       # Incumbents/probes were deliberately not FAST-evaluated. Compare
+       # only paired observations actually measured by both evaluators.
+       if id >= 0 and id < fastCaseScores.len and id < caseScores.len and
+-         fastCaseScores[id].len > 0 and fastCaseScores[id].len == caseScores[id].len:
++         fastCaseScores[id].len > 0 and caseScores[id].len > 0:
++        # FAST may intentionally cover only one case from each timescale.
++        # Correlation is therefore between the cheap partial objective and the
++        # exact six-case FULL objective; that is precisely the screening error
++        # we need to measure.
+         fastValues.add(aggregateCaseScores(fastCaseScores[id]))
+         fullValues.add(aggregateCaseScores(caseScores[id]))
+     if fastValues.len < 4:
+@@ -10994,12 +11066,12 @@
+ 
+   var screeningCorr = screeningCorrelation(fullIds)
+   var extraTarget = 0
+-  if screeningCorr < 0.58:
++  if screeningCorr < 0.55:
+     extraTarget = ADAPTIVE_FULL_EXTRA_MAX
+-  elif screeningCorr < 0.70:
+-    extraTarget = min(16, ADAPTIVE_FULL_EXTRA_MAX)
+-  elif screeningCorr < 0.80:
+-    extraTarget = min(8, ADAPTIVE_FULL_EXTRA_MAX)
++  elif screeningCorr < 0.66:
++    extraTarget = min(4, ADAPTIVE_FULL_EXTRA_MAX)
++  elif screeningCorr < 0.75:
++    extraTarget = min(2, ADAPTIVE_FULL_EXTRA_MAX)
+   # A candidate that FAST actually rejected but FULL found superior is
+   # evidence of missed coverage, even when the merit-only correlation is high.
+   # Do not spend the entire adaptive budget on ONE marginal miss: with an
+@@ -11042,30 +11114,31 @@
+       screeningCorr = screeningCorrelation(fullIds)
+ 
+   # The independent audit is included in FULL-ranked selection and in the
+-  # paired FAST/FULL correlation above; its observed misses also expand FULL.
+-  # FAST now has one semantic-safe cost knob: sample stride.
+-  # Higher stride means fewer sampled observations. A single small merit miss is
+-  # deliberately treated as a HOLD signal rather than immediately forcing the
+-  # old dense stride=3 behavior. Genuine best misses / repeated or large misses
+-  # still make screening denser immediately.
++  # paired FAST/FULL correlation above. v31 has two semantic-safe screening
++  # cost knobs: number of cases and observations per case. Temporal execution
++  # itself remains exact; poor screening restores coverage automatically.
+   let previousFastStride = adaptiveFastEvalStride
+   let severeAuditMiss = auditMissedBest > 0 or auditMissedMerit >= 2 or
+     (auditMissedMerit > 0 and auditMaxMargin > FAST_AUDIT_SEVERE_MARGIN)
+-  if severeAuditMiss:
+-    adaptiveFastEvalStride = max(FAST_EVAL_STRIDE_MIN, adaptiveFastEvalStride - 1)
+-  elif screeningCorr < 0.66:
+-    adaptiveFastEvalStride = max(FAST_EVAL_STRIDE_MIN, adaptiveFastEvalStride - 1)
+-  elif screeningCorr < 0.76:
+-    if auditMissedMerit > 0:
+-      adaptiveFastEvalStride = max(FAST_EVAL_STRIDE_MIN, adaptiveFastEvalStride - 1)
+-  elif auditMissedMerit == 1:
+-    # One modest rejection-audit miss with otherwise decent rank correlation is
+-    # not enough evidence to pay for a denser dataset next generation.
+-    discard
+-  elif screeningCorr > 0.93:
+-    adaptiveFastEvalStride = min(FAST_EVAL_STRIDE_MAX, adaptiveFastEvalStride + 1)
+-  elif screeningCorr > 0.86:
++
++  # First spend/recover CASE coverage; it buys much more compute than shaving a
++  # single trajectory point.  Always retain at least one case per timescale.
++  if severeAuditMiss or screeningCorr < 0.68:
++    adaptiveFastCaseCount = min(FAST_CASE_COUNT_MAX, adaptiveFastCaseCount + 2)
++  elif screeningCorr < 0.80:
++    adaptiveFastCaseCount = min(FAST_CASE_COUNT_MAX, adaptiveFastCaseCount + 1)
++  elif screeningCorr > 0.92 and auditMissedMerit == 0:
++    adaptiveFastCaseCount = max(FAST_CASE_COUNT_MIN, adaptiveFastCaseCount - 1)
++
++  # Observation density is the secondary knob.  Never return to stride=2: on
++  # this 20-point objective it nearly doubles FAST work for little measured
++  # ranking benefit.  Only use stride=4 after very strong paired agreement.
++  if severeAuditMiss or screeningCorr < 0.76:
++    adaptiveFastEvalStride = FAST_EVAL_STRIDE_MIN
++  elif screeningCorr > 0.97 and auditMissedMerit == 0:
+     adaptiveFastEvalStride = min(FAST_EVAL_STRIDE_MAX, adaptiveFastEvalStride + 1)
++  elif screeningCorr < 0.90:
++    adaptiveFastEvalStride = max(FAST_EVAL_STRIDE_MIN, adaptiveFastEvalStride - 1)
+ 
+   if adaptiveFastEvalStride != previousFastStride:
+     let nextFast = buildFastEvalDataset(evalAggsX, evalAggsY, adaptiveFastEvalStride, fastPhase)
+@@ -11073,18 +11146,23 @@
+     fastAggsY = nextFast.y
+     fastRankedY = buildRankedY(fastAggsY)
+ 
++  lastScreeningCorrelation = screeningCorr
+   refreshAdaptiveLexicaseEpsilon(caseScores, fullIds)
+ 
+   var fastPointsSummary = "["
+-  for ci, xs in fastAggsX:
++  for ci, xs in screenAggsX:
+     if ci > 0: fastPointsSummary.add(",")
+     fastPointsSummary.add($xs.len)
+   fastPointsSummary.add("]")
+   echo "  screening fast/full spearman=", formatFloat(screeningCorr, ffDecimal, 3),
+        " adaptive_extra=", adaptiveExtraIds.len,
+        " fast_rounds=FULL,",
++       " fast_cases_used=", fastCaseIndices,
++       " fast_cases_next=", adaptiveFastCaseCount,
+        " fast_stride_next=", adaptiveFastEvalStride,
+-       " fast_points_next=", fastPointsSummary,
++       " fast_points_used=", fastPointsSummary,
++       " audit_due=", auditDue,
++       " merit_full_target=", requestedFullTop,
+        " lex_eps=", adaptiveLexicaseEpsilon
+ 
+   for jp in fullIds:
+@@ -11815,19 +11893,21 @@
+   mutationProbes.setLen(0)
+   # A small controlled mutation-only lane: no crossover/FFT confounds.
+   # Parents remain in the protected prefix and are re-evaluated after refresh.
+-  for k in 0 ..< min(MUTATION_PROBE_COUNT, pop_size - new_population.len):
+-    if survivorIds.len == 0: break
+-    let parent = rand(min(coreEliteCount, survivorIds.len) - 1)
+-    var probeChild = cloneGenome(new_population[parent])
+-    mutateGenome(probeChild, feedbackMutationScale, 0, localMutationCap(stagnation))
+-    mutationProbes.add((parent: parent, child: new_population.len))
+-    new_population.add(probeChild)
++  if iter mod MUTATION_PROBE_INTERVAL == 0:
++    for k in 0 ..< min(MUTATION_PROBE_COUNT, pop_size - new_population.len):
++      if survivorIds.len == 0: break
++      let parent = rand(min(coreEliteCount, survivorIds.len) - 1)
++      var probeChild = cloneGenome(new_population[parent])
++      mutateGenome(probeChild, feedbackMutationScale, 0, localMutationCap(stagnation))
++      mutationProbes.add((parent: parent, child: new_population.len))
++      new_population.add(probeChild)
+ 
+   # Matched crossover experiment: all eligible operators see the SAME
+   # parent/donor pair.  v29 used a different random pair for each operator, so
+   # operator EMA mixed operator quality with pair difficulty.  The unchanged
+   # parent is already FULL-protected and every probe child is compulsory FULL.
+-  if survivorIds.len >= 2 and coreEliteCount > 0 and
++  if iter mod CROSSOVER_PROBE_INTERVAL == 0 and
++     survivorIds.len >= 2 and coreEliteCount > 0 and
+      new_population.len < pop_size:
+     let parent = rand(min(coreEliteCount, survivorIds.len) - 1)
+     let pId = survivorIds[parent]

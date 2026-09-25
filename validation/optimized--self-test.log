@@ -1,0 +1,3 @@
+PASS: elite log-threshold admission, strict boundary and ring restoration
+PASS: configured case weights and full-range trajectory sampling
+PASS: AAA=1500, loose Pareto champion preservation and budget guard

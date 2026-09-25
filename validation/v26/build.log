@@ -1,0 +1,44 @@
+Hint: used config file '/tmp/nim-2.2.4/config/nim.cfg' [Conf]
+Hint: used config file '/tmp/nim-2.2.4/config/config.nims' [Conf]
+.....................................................................................................................................
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(34, 11) Warning: use the nimble packages `malebolgia`, `taskpools` or `weave` instead; threadpool is deprecated [Deprecated]
+.......
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(1926, 9) Hint: 'OP_COUNT' is declared but not used [XDeclaredButNotUsed]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(2339, 7) Warning: use `delete(s, first..last)`; delete is deprecated [Deprecated]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(2347, 7) Warning: use `delete(s, first..last)`; delete is deprecated [Deprecated]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(2360, 9) Warning: use `delete(s, first..last)`; delete is deprecated [Deprecated]
+......
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(2191, 6) Hint: 'at' is declared but not used [XDeclaredButNotUsed]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(2210, 6) Hint: 'makeRandomPatternSegment' is declared but not used [XDeclaredButNotUsed]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(2464, 7) Hint: 'JEV_HALL_COMPARE_SLOTS' is declared but not used [XDeclaredButNotUsed]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(2467, 7) Hint: 'JEV_DONOR_POOL_CAP' is declared but not used [XDeclaredButNotUsed]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(2468, 7) Hint: 'JEV_DONOR_MIN_DISTANCE' is declared but not used [XDeclaredButNotUsed]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(2473, 7) Hint: 'JEV_DONOR_RATE' is declared but not used [XDeclaredButNotUsed]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(2474, 7) Hint: 'JEV_FRESH_DONOR_RATE' is declared but not used [XDeclaredButNotUsed]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(2561, 6) Hint: 'weightScore' is declared but not used [XDeclaredButNotUsed]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(2564, 6) Hint: 'weightScoreDerivative' is declared but not used [XDeclaredButNotUsed]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(2567, 6) Hint: 'randomCutPoints' is declared but not used [XDeclaredButNotUsed]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(2992, 6) Hint: 'swapRandomRows' is declared but not used [XDeclaredButNotUsed]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(3005, 6) Hint: 'swapABRows' is declared but not used [XDeclaredButNotUsed]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(3081, 7) Hint: 'MAX_REASONABLE_WEIGHT' is declared but not used [XDeclaredButNotUsed]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(3155, 6) Hint: 'mutateWeightAffine' is declared but not used [XDeclaredButNotUsed]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(4875, 6) Hint: 'parallelEvaluateIndividualBatch' is declared but not used [XDeclaredButNotUsed]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(4986, 6) Hint: 'erfinv' is declared but not used [XDeclaredButNotUsed]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(5253, 7) Hint: 'POLL_INTERVAL_MS' is declared but not used [XDeclaredButNotUsed]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(5254, 7) Hint: 'STUCK_LOG_EVERY_N_POLLS' is declared but not used [XDeclaredButNotUsed]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(5362, 6) Hint: 'jevHallInjectionOrder' is declared but not used [XDeclaredButNotUsed]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(5593, 6) Hint: 'bestArchiveEntry' is declared but not used [XDeclaredButNotUsed]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(6431, 6) Hint: 'rollingAgeAtResume' is declared but not used [XDeclaredButNotUsed]
+/workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim(7299, 7) Hint: 'JEV_SURVIVOR_SLOTS' is declared but not used [XDeclaredButNotUsed]
+CC: ../../../../../tmp/nim-2.2.4/lib/system/dollars.nim
+CC: ../../../../../tmp/nim-2.2.4/lib/system.nim
+CC: ../../../../../tmp/nim-2.2.4/lib/pure/collections/sequtils.nim
+CC: ../../../../../tmp/nim-2.2.4/lib/pure/random.nim
+CC: ../../../../../tmp/nim-2.2.4/lib/pure/collections/tables.nim
+CC: ../../../../../tmp/nim-2.2.4/lib/pure/streams.nim
+CC: ../../../../../tmp/nim-2.2.4/lib/pure/concurrency/threadpool.nim
+CC: ../../../../../tmp/nim-2.2.4/lib/pure/collections/sets.nim
+CC: at_jev.nim
+Hint:  [Link]
+Hint: mm: orc; threads: on; opt: speed; options: -d:release
+81573 lines; 34.163s; 218.621MiB peakmem; proj: /workspace/scratch/95ee4930f983/work/jev_embedding256/at_jev.nim; out: /tmp/jev_checked [SuccessX]

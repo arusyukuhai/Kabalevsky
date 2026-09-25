@@ -1,0 +1,6 @@
+corpus stats: ngram_seeds=193 chunks=32
+Loaded checkpoint: fresh.bin next_generation=16 elite_archive=20 graph_points=16
+evaluation mode: parallel individual evaluation (--threads:on)
+rolling evaluation schedule: fast=11, medium=3, slow=2; credit scheduler, at most one refresh per generation
+Jev lane ON: every 5 generations, 64 FULL genomes x <=2500 scoring proposals; generation workers=9; provider charges may apply
+[checkpoint] saved: resumed.bin (next_generation=16)

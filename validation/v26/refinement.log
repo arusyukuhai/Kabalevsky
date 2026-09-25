@@ -1,0 +1,2 @@
+PASS: 300 Pareto/HV equivalence cases, finite/tied extrema, parent accounting, exact cohort deduplication
+pareto_benchmark before_s=0.322816427 after_s=0.02281107000000003 speedup=14.151744175086902

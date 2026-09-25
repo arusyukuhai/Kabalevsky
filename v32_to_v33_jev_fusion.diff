@@ -1,0 +1,756 @@
+--- /mnt/data/at_jev_v32_race.nim	2026-09-25 09:01:42.170372305 +0000
++++ /mnt/data/at_jev_v33_jev_fusion.nim	2026-09-25 09:32:17.230676879 +0000
+@@ -29,6 +29,10 @@
+ # v31: adaptive partial-case FAST screening, sparse audits/probes, cheaper hot path.
+ # v32: sequential-race FAST screening: all optional offspring see 3 balanced cases;
+ #      only progressively smaller contender pools see cases 4/5/6 before FULL.
++# v33: Jev/outer-GA cadence normalization for 64x6400 every 20 generations:
++#      fresh/stale influence separation, 8-slot bounded survival, due-only
++#      nursery reservoir, stable 64-model cohort lanes, repeat-free Jev metric,
++#      fixed-range G/J Pareto normalization, and MA10 progress.
+ # Audit: bounded parent pools, exact-duplicate rescue, cached distance minima.
+ # Build: nim c -d:release --threads:on at.nim
+ # Verify: ./at --regression-test && ./at --self-test
+@@ -2529,19 +2533,37 @@
+ # いったん入った個体は通常の世代交代では捨てない。
+ var eliteOfElites: seq[EliteArchiveEntry] = @[]
+ 
++# Jev cadence and inner TEXT-GA budget. Keep these next to the outer-fusion
++# controls so the two layers cannot silently drift to different cadences.
++const JEV_BRIDGE_PROTOCOL = 1
++const JEV_MAX_MODELS = 64
++const JEV_DEFAULT_MODELS = 64
++const JEV_GENERATION_INTERVAL = 20
++const JEV_STEPS = 6400
++const JEV_SUFFIX_LENGTH = 64
++# Inner TEXT GA, independent for each outer Genome. Evaluations include the
++# initial population and every offspring; reusing an elite costs no evaluation.
++const JEV_INNER_POPULATION = 20
++const JEV_INNER_ELITES = 3
++const JEV_INNER_TOURNAMENT = 3
++const JEV_INNER_CROSSOVER_PERCENT = 45
++const JEV_INNER_IMMIGRANT_PERCENT = 3
++static:
++  doAssert JEV_INNER_POPULATION <= JEV_STEPS
++  doAssert JEV_INNER_ELITES > 0 and JEV_INNER_ELITES < JEV_INNER_POPULATION
++  doAssert JEV_INNER_TOURNAMENT >= 2 and JEV_INNER_TOURNAMENT <= JEV_INNER_POPULATION
++  doAssert JEV_INNER_CROSSOVER_PERCENT in 0..100
++  doAssert JEV_INNER_IMMIGRANT_PERCENT in 0..100
++const JEV_SURVIVOR_SLOTS = 8
++const JEV_MA_WINDOW = 10
++
+ const JEV_HALL_CAPACITY = 64
+ const JEV_HALL_INJECT_SLOTS = 4
+-const JEV_HALL_COMPARE_SLOTS = 12
+ const JEV_HALL_TOP_FINISH = 8
+ const JEV_HALL_CONFIRM_WINS = 3
+-const JEV_DONOR_POOL_CAP = 12
+-const JEV_DONOR_MIN_DISTANCE = 0.20
+-# Jev now runs every five generations, so its genetic influence must be much
+-# narrower than its observation cohort. Jev NEVER overwrites GA fitness. A
+-# Jev-only champion may live in the Hall, but may breed only after passing the
+-# Legacy Hall records remain readable; adaptive fusion below owns selection.
+-const JEV_DONOR_RATE = 5
+-const JEV_FRESH_DONOR_RATE = 8
++# The old Hall stays readable for checkpoint migration/regression tests. Runtime
++# selection is owned by the adaptive G/J fusion below; historical Jev quality is
++# never copied into GA fitness.
+ var jevHall: seq[JevHallEntry] = @[]
+ var jevHallConfig = "" # same prompt/model/steps/cohort configuration as the quality proxy
+ 
+@@ -5349,7 +5371,8 @@
+       bounds.lo = min(right.lo, previous.lo)
+       bounds.hi = max(right.hi, previous.hi)
+     let rightAxis = paddedPlotRange(bounds, PLOT_RIGHT_MIN_SPAN)
+-    jevAxis = "set y2label \"Jev rank-weighted quality MA20 (not accuracy)\"\n" &
++    jevAxis = "set y2label \"Jev fresh rank-weighted quality MA" & $JEV_MA_WINDOW &
++      " (not accuracy)\"\n" &
+       "set y2tics\nset y2range [" & $rightAxis.lo & ":" & $rightAxis.hi & "]"
+     if previous.valid:
+       let oldPath = "\"" & previousJevProgressPath.replace("\\", "\\\\").replace("\"", "\\\"") & "\""
+@@ -5361,7 +5384,7 @@
+       let quotedPath = "\"" & jevProgressPath.replace("\\", "\\\\").replace("\"", "\\\"") & "\""
+       jevSeries.add(", " & "\\" & "\n     " & quotedPath &
+         " using (($1+1 >= 200) ? $1+1 : 1/0):3 axes x1y2" &
+-        " with linespoints pt 5 ps 0.45 lw 2 title 'Jev rank-weighted MA20 (current settings)'")
++        " with linespoints pt 5 ps 0.45 lw 2 title 'Jev fresh rank-weighted MA" & $JEV_MA_WINDOW & " (current settings)'")
+   var script = PLOT_SCRIPT.replace("__XMIN__", $PLOT_START_GENERATION)
+   script = script.replace("__XMAX__", $xmax)
+   script = script.replace("__LEFT_LO__", $leftAxis.lo)
+@@ -5645,18 +5668,25 @@
+ var fusionArchive: seq[FusionMember] = @[]
+ var fusionAnchors: seq[FusionMember] = @[]
+ var fusionPending: seq[FusionPending] = @[]
++var fusionPendingSeen = 0 # eligible fusion children seen since the last Jev round
+ var fusionReliability = 0.0
+ var fusionEvidence = 0
+ var fusionNoise = 0.0
+ const FUSION_ANCHORS = 8
+-const FUSION_CAP = 16
++const FUSION_CAP = 16              # remembered Pareto points, not direct survivors
+ const FUSION_NURSERY = 8
+-const FUSION_INTERVAL = 5
++const FUSION_INTERVAL = JEV_GENERATION_INTERVAL
++# v33: with Jev only every 20 generations, a flat 25% donor rate would let one
++# stale observation dominate an entire outer-GA cycle. Preserve roughly the old
++# integrated influence (25% x ~5 generations) with a 12% peak and linear age decay.
++const JEV_MAX_DONOR_PERCENT = 12
++const JEV_UNTRUSTED_SURVIVOR_FRACTION = 0.25 # at most 2/8 slots before trust
+ 
+ proc resetFusion() =
+   fusionArchive.setLen(0)
+   fusionAnchors.setLen(0)
+   fusionPending.setLen(0)
++  fusionPendingSeen = 0
+   fusionReliability = 0.0
+   fusionEvidence = 0
+   fusionNoise = 0.0
+@@ -5733,8 +5763,11 @@
+   result.signal = lowerR * max(0.0, 1.0 - noiseVar / spread)
+ 
+ proc fusionUpdateTrust(a, b: seq[float]) =
++  # Missing calibration evidence is not negative evidence. Under a 20-generation
++  # cadence, one short FULL cohort must not halve months of accumulated trust.
++  if a.len < 6 or a.len != b.len: return
+   let measure = fusionRepeatSignal(a, b)
+-  if a.len >= 6: inc fusionEvidence
++  inc fusionEvidence
+   let target = measure.signal * min(1.0, float(fusionEvidence)/4.0)
+   let alpha = if target < fusionReliability: 0.5 else: 0.25
+   fusionReliability += alpha * (target - fusionReliability)
+@@ -5788,10 +5821,14 @@
+     var height = 0.0
+     for id in ids:
+       if id == omit: continue
+-      # Fixed reference (-1.01,-0.01); never normalize by a changing cohort.
+-      let y = points[id].j + 0.01
++      # Normalize by the KNOWN mathematical objective ranges, not by this
++      # cohort. G is Spearman in [-1,1], J is rubric quality in [0,1]. The old
++      # area used a ~2-wide G axis against a ~1-wide J axis, which biased HV
++      # pruning toward G. Fixed-range normalization keeps both objectives equal.
++      let x = max(0.0, min(1.0, (points[id].g + 1.01) / 2.02))
++      let y = max(0.0, min(1.0, (points[id].j + 0.01) / 1.02))
+       if y > height:
+-        result += max(0.0, points[id].g + 1.01) * (y-height)
++        result += x * (y-height)
+         height = y
+   while result.len > cap:
+     let total = area(result, -1)
+@@ -5808,7 +5845,27 @@
+     result.delete(victim)
+   result.sort(proc(a,b: int): int = cmp(points[a].g, points[b].g))
+ 
++proc fusionLatestGeneration(): int =
++  result = -1
++  for m in fusionArchive: result = max(result, m.generation)
++
++proc fusionFreshness(iter: int): float =
++  ## External evidence is strongest immediately after a Jev round and becomes
++  ## stale as the outer GA moves for twenty generations. This decay is about
++  ## relevance, not confidence: `fusionReliability` separately measures repeat
++  ## consistency of the rubric.
++  let observed = fusionLatestGeneration()
++  if observed < 0: return 0.0
++  let age = max(0, iter - observed)
++  max(0.0, 1.0 - float(age) / float(FUSION_INTERVAL))
++
++proc fusionInfluence(iter: int): float {.inline.} =
++  max(0.0, min(1.0, fusionReliability * fusionFreshness(iter)))
++
+ proc fusionInject(dest: var seq[Genome], generation, limit: int) =
++  ## `generation` is the iteration index of the population being built. Jev
++  ## executes when (generation+1) is divisible by the interval. Calibration
++  ## snapshots are therefore injected only into that exact population.
+   var fps: seq[Hash] = @[]
+   for g in dest: fps.add(genomeFingerprint(g))
+   proc addUnique(dest: var seq[Genome], fps: var seq[Hash], g: Genome, limit: int) =
+@@ -5818,14 +5875,32 @@
+       if fps[i] == fp and sameGenomeContent(old, g): return
+     dest.add(cloneGenome(g))
+     fps.add(fp)
+-  # Only inject calibration models immediately before an actual Jev round.
+-  if (generation + 1) mod FUSION_INTERVAL == 0:
+-    for anchor in fusionAnchors: addUnique(dest, fps, anchor.genome, limit)
+-  for pending in fusionPending:
+-    if generation <= pending.due: addUnique(dest, fps, pending.genome, limit)
+-  let count = if (generation + 1) mod FUSION_INTERVAL == 0: fusionArchive.len
+-              else: min(fusionArchive.len, int(round(FUSION_CAP.float*fusionReliability)))
+-  # Evenly spaced along the front, including both extremes when count >= 2.
++
++  let calibrationRound = (generation + 1) mod FUSION_INTERVAL == 0
++  if calibrationRound:
++    # Exact repeat anchors estimate Jev reliability. Pending children are kept
++    # only as snapshots between rounds and get ONE protected chance at their
++    # due Jev round; they no longer become 20-generation pseudo-elites.
++    for anchor in fusionAnchors:
++      addUnique(dest, fps, anchor.genome, limit)
++    for pending in fusionPending:
++      if generation == pending.due:
++        addUnique(dest, fps, pending.genome, limit)
++
++  var count = 0
++  if fusionArchive.len > 0:
++    if calibrationRound:
++      # Recheck a bounded cross-objective front at the next Jev round even if
++      # trust is low. This is measurement, not unrestricted breeding authority.
++      count = min(JEV_SURVIVOR_SLOTS, fusionArchive.len)
++    else:
++      # A fresh but not-yet-trusted Jev result may preserve at most two of eight
++      # front points passively. Confirmed repeatability expands this to eight.
++      let confidence = JEV_UNTRUSTED_SURVIVOR_FRACTION +
++        (1.0 - JEV_UNTRUSTED_SURVIVOR_FRACTION) * fusionReliability
++      count = min(JEV_SURVIVOR_SLOTS, int(round(
++        float(JEV_SURVIVOR_SLOTS) * confidence * fusionFreshness(generation))))
++  # Evenly spaced along the remembered front, preserving both objective ends.
+   for i in 0 ..< count:
+     let pos = if count <= 1: fusionArchive.len-1
+               else: i*(fusionArchive.len-1) div (count-1)
+@@ -5911,7 +5986,7 @@
+     fixedMovingAvg: float
+ 
+ const CHECKPOINT_MAGIC = "KLEISMIC_GA_CHECKPOINT"
+-const CHECKPOINT_VERSION = 30
++const CHECKPOINT_VERSION = 31
+ const CHECKPOINT_OBJECTIVE_VERSION = 30 # v30: unbiased equal-case 6x20 objective
+ var migratedRuleCount = false
+ var loadedCheckpointVersion = 0
+@@ -6256,6 +6331,9 @@
+   for p in fusionPending:
+     writeGenome(s, p.genome)
+     s.write(p.due.int64)
++  # v31: reservoir bookkeeping prevents a 20-generation nursery from being
++  # permanently occupied by the first few Jev-mating children after a round.
++  s.write(fusionPendingSeen.int64)
+ 
+ proc readFusion(s: Stream, version, nextIter: int) =
+   resetFusion()
+@@ -6294,6 +6372,12 @@
+     if g.len != AAA or due < nextIter or due >= nextIter + FUSION_INTERVAL:
+       raise newException(IOError, "Invalid adaptive Jev nursery expiry")
+     fusionPending.add(FusionPending(genome: g, due: due))
++  if version >= 31:
++    fusionPendingSeen = int(s.readInt64())
++    if fusionPendingSeen < fusionPending.len or fusionPendingSeen > 1_000_000_000:
++      raise newException(IOError, "Invalid adaptive Jev nursery reservoir state")
++  else:
++    fusionPendingSeen = fusionPending.len
+ 
+ proc writeDataset(s: Stream, xs: seq[seq[seq[int]]], ys: seq[seq[int]]) =
+   let chunks = min(xs.len, ys.len)
+@@ -6421,7 +6505,7 @@
+   # これによりcheckpoint再開後も「固定評価」が本当に同一データになる。
+   writeDataset(fs, evalAggsX, evalAggsY)
+   writeJevHall(fs) # legacy Hall retained for migration
+-  writeFusion(fs) # v24: reliability, exact anchors/front, pending offspring
++  writeFusion(fs) # v31: reliability, anchors/front, due-only nursery + reservoir state
+   fs.write(0x4B4C4D56434B5036'i64) # KLMVCP6 / checkpoint end marker
+   fs.close()
+ 
+@@ -6488,7 +6572,7 @@
+       raise newException(IOError, "Invalid checkpoint magic: " & path)
+ 
+     let version = int(fs.readInt64())
+-    if version < 3 or (version > 9 and version notin [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, CHECKPOINT_VERSION]):
++    if version < 3 or (version > 9 and version notin [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 30, CHECKPOINT_VERSION]):
+       raise newException(IOError, "Unsupported checkpoint version: " & $version)
+ 
+     nextIter = int(fs.readInt64())
+@@ -7550,25 +7634,6 @@
+ # RNG and scoring scratch are local; GA random state is untouched.
+ # The external Jev process receives texts, never genomes or training data.
+ # ---------------------------------------------------------------------------
+-const JEV_BRIDGE_PROTOCOL = 1
+-const JEV_MAX_MODELS = 64
+-const JEV_DEFAULT_MODELS = 64
+-const JEV_GENERATION_INTERVAL = 5   # completed generations 5, 10, 15, ... (iter 4, 9, 14, ...)
+-const JEV_STEPS = 2500
+-const JEV_SUFFIX_LENGTH = 64
+-# Inner TEXT GA, independent for each outer Genome. Evaluations include the
+-# initial 16 seeds and every offspring; reusing an elite costs no evaluation.
+-const JEV_INNER_POPULATION = 16
+-const JEV_INNER_ELITES = 2
+-const JEV_INNER_TOURNAMENT = 3
+-const JEV_INNER_CROSSOVER_PERCENT = 45
+-const JEV_INNER_IMMIGRANT_PERCENT = 3
+-static:
+-  doAssert JEV_INNER_POPULATION <= JEV_STEPS
+-  doAssert JEV_INNER_ELITES > 0 and JEV_INNER_ELITES < JEV_INNER_POPULATION
+-  doAssert JEV_INNER_TOURNAMENT >= 2
+-const JEV_SURVIVOR_SLOTS = 8
+-const JEV_MA_WINDOW = 20
+ 
+ type
+   JevGenerated = object
+@@ -7653,8 +7718,9 @@
+                  prompt: string, alphabet: seq[int], cumulative: seq[float],
+                  grams: seq[GenerationGram],
+                  editUpperSchedule: ptr seq[int]): JevGenerated {.gcsafe.} =
+-  ## EXACTLY 2,500 logical candidate evaluations per outer model:
+-  ## 16 initial seeds + 2,484 offspring. Elites/parents are NEVER rescored.
++  ## EXACTLY JEV_STEPS logical candidate evaluations per outer model:
++  ## JEV_INNER_POPULATION initial seeds plus scored offspring. Elites/parents
++  ## are NEVER rescored.
+   ## Cache hits count as logical evaluations as in the previous hill climber;
+   ## actualScoreCalls separately counts expensive scoreRaw invocations.
+   result.id = id
+@@ -7662,7 +7728,7 @@
+   template scratch: var EvalScratch = getThreadEvalScratch(g.len)
+   prepareScoreScratch(g, scratch)
+   let generationIndex = generationCandidateIndex(index)
+-  # The prompt is fixed for all 16k proposals. Avoid allocating a UTF-8 string
++  # The prompt is fixed for every proposal. Avoid allocating a UTF-8 string
+   # and then converting that string back to byte integers on every score.
+   let promptBytes = textBytes(prompt)
+   var scoreInput = newSeqOfCap[int](promptBytes.len + JEV_SUFFIX_LENGTH * 4)
+@@ -7699,8 +7765,8 @@
+     # a future mutation refactor cannot invalidate a hash-table key in place.
+     memo[cloneInts(suffix)] = result
+ 
+-  # Maintain 16 diverse text lineages rather than mutating one greedy incumbent.
+-  # Sorting ensures the best two survive each GENERATION without reevaluation.
++  # Maintain JEV_INNER_POPULATION diverse text lineages rather than mutating one
++  # greedy incumbent. Sorting preserves JEV_INNER_ELITES without reevaluation.
+   var innerPop = newSeqOfCap[JevInnerIndividual](JEV_INNER_POPULATION)
+   var bestScore = -Inf
+   var bestSuffix: seq[int] = @[]
+@@ -8015,7 +8081,8 @@
+ 
+ proc writeJevProgress(path: string, points: seq[JevPoint]) =
+   ## Atomically replace one row per successful Jev evaluation.
+-  var lines = "generation,jev_rank_weighted_quality,jev_rank_weighted_ma20\n"
++  let header = "generation,jev_fresh_rank_weighted_quality,jev_fresh_rank_weighted_ma" & $JEV_MA_WINDOW
++  var lines = header & "\n"
+   for p in points:
+     lines.add($p.generation & "," & $p.quality & "," & $p.average & "\n")
+   writeFile(path & ".tmp", lines)
+@@ -8029,7 +8096,7 @@
+   # Refuse silently reinterpreting a legacy equal-weight CSV as weighted data.
+   # The configuration check above normally prevents this; validate its header
+   # as a second line of defense before parsing old observations.
+-  let expectedHeader = "generation,jev_rank_weighted_quality,jev_rank_weighted_ma20"
++  let expectedHeader = "generation,jev_fresh_rank_weighted_quality,jev_fresh_rank_weighted_ma" & $JEV_MA_WINDOW
+   if not readFile(path).startsWith(expectedHeader & "\n"):
+     quit("[jev-plot] incompatible Jev CSV header; refusing to overwrite " & path)
+   var previous = -1
+@@ -8859,19 +8926,22 @@
+     replacementRevision: freshReplacementRevision())]
+   var changed = cloneGenome(g)
+   changed[0].weight = 2.0
+-  fusionArchive = @[fusionSnapshot(g,0.7,4)]
+-  fusionAnchors = @[fusionSnapshot(g,0.7,4)]
++  # Observation at completed generation 20 (iter 19), next calibration at iter 39.
++  fusionArchive = @[fusionSnapshot(g,0.7,19)]
++  fusionAnchors = @[fusionSnapshot(g,0.7,19)]
+   doAssert fusionMatch(changed, fusionArchive) == -1
+-  fusionPending = @[FusionPending(genome:cloneGenome(changed),due:9)]
++  fusionPending = @[FusionPending(genome:cloneGenome(changed),due:39)]
++  fusionPendingSeen = 7
+   var next: seq[Genome] = @[]
+-  fusionInject(next, 5, 450)
+-  doAssert next.len == 1 and sameGenomeContent(next[0], changed)
++  fusionInject(next, 20, 450)
++  doAssert next.len == 1 and sameGenomeContent(next[0], g)
++  # Pending children stay off-population until their exact due round.
+   next.setLen(0)
+-  fusionInject(next, 9, 450)
+-  doAssert next.len == 2 # calibration + pending; archive duplicate suppressed
++  fusionInject(next, 39, 450)
++  doAssert next.len == 2 # calibration anchor + pending; archive duplicate suppressed
+   next.setLen(0)
+-  fusionInject(next, 10, 450)
+-  doAssert next.len == 0 # expired; zero trust archive cannot breed/survive
++  fusionInject(next, 40, 450)
++  doAssert next.len == 0 # stale zero-trust front no longer survives
+   fusionReliability = 0.6
+   fusionEvidence = 8
+   fusionNoise = 0.03
+@@ -8880,10 +8950,11 @@
+   stream.write(12345'i64)
+   stream.setPosition(0)
+   resetFusion()
+-  readFusion(stream,24,5)
++  readFusion(stream,CHECKPOINT_VERSION,20)
+   doAssert abs(fusionReliability-0.6) < 1e-12 and fusionEvidence == 8
+   doAssert fusionArchive.len == 1 and fusionAnchors.len == 1 and fusionPending.len == 1
+-  doAssert fusionPending[0].due == 9 and sameGenomeContent(fusionPending[0].genome,changed)
++  doAssert fusionPending[0].due == 39 and sameGenomeContent(fusionPending[0].genome,changed)
++  doAssert fusionPendingSeen == 7
+   doAssert stream.readInt64() == 12345'i64
+   stream.close()
+   let legacy = newStringStream()
+@@ -8905,7 +8976,7 @@
+   invalid.close()
+   resetFusion()
+   AAA = oldAAA
+-  echo "PASS: adaptive Jev trust, Pareto extremes, nursery expiry, genome identity, v25 roundtrip and v23 migration"
++  echo "PASS: adaptive Jev trust, normalized Pareto HV, due-only nursery, genome identity, v31 roundtrip and v23 migration"
+   quit(0)
+ 
+ if "--filter-test" in commandLineParams():
+@@ -10442,7 +10513,8 @@
+   echo "Jev lane OFF: set TYPESAFE_API_KEY (or JEV_API_KEY), put jev_bridge.py next to binary, and omit --no-jev"
+ else:
+   echo "Jev lane ON: every ", JEV_GENERATION_INTERVAL, " generations, ", jevModelCount,
+-       " FULL genomes x <=2500 scoring proposals; generation workers=",
++       " FULL genomes x ", JEV_STEPS, " TEXT-GA evaluations (inner pop=",
++       JEV_INNER_POPULATION, ", elites=", JEV_INNER_ELITES, "); generation workers=",
+        jevGenerationWorkers, "; provider charges may apply"
+ var jevAlphabet: seq[int] = @[]
+ var jevCumulative: seq[float] = @[]
+@@ -10455,15 +10527,25 @@
+     total += sqrt(float(frequency))
+     jevCumulative.add(total)
+   jevGrams = priors.grams
+-# A different Jev scoring configuration OR graph metric starts a new MA20 series.
+-# Preserve the old CSV separately: legacy equal-weight MA20 cannot be converted
+-# into rank-weighted history without archived per-candidate scores/rankings.
++# A different Jev generation/fusion configuration OR graph metric starts a new
++# moving-average series. Historical-repeat filtering cannot be reconstructed from
++# old CSV rows, so incompatible curves are archived rather than spliced.
+ let jevConfigPath = jevProgressPath & ".config.json"
+ let jevConfig = $(%*{"prompt": jevPrompt, "model": jevModel,
++                    "interval": JEV_GENERATION_INTERVAL,
+                     "steps": JEV_STEPS, "suffix": JEV_SUFFIX_LENGTH,
+-                    "candidates": jevModelCount, "generation_algorithm": 6,
++                    "candidates": jevModelCount,
++                    "inner_population": JEV_INNER_POPULATION,
++                    "inner_elites": JEV_INNER_ELITES,
++                    "inner_tournament": JEV_INNER_TOURNAMENT,
++                    "inner_crossover_percent": JEV_INNER_CROSSOVER_PERCENT,
++                    "inner_immigrant_percent": JEV_INNER_IMMIGRANT_PERCENT,
++                    "survivor_slots": JEV_SURVIVOR_SLOTS,
++                    "ma_window": JEV_MA_WINDOW,
++                    "generation_algorithm": 7,
++                    "fusion_algorithm": 3,
+                     "internal_tokens": EMBEDDING_CODE_COUNT,
+-                    "quality_metric": "rank_linear_weighted_v1",
++                    "quality_metric": "fresh_rank_linear_weighted_v2",
+                     "version": JEV_BRIDGE_PROTOCOL})
+ # v20 checkpoints have no Hall and remain loadable. A Jev configuration change
+ # invalidates only Hall rankings, never GA history, genomes or conventional EoE.
+@@ -10477,7 +10559,7 @@
+                     readFile(jevConfigPath) == jevConfig
+ if loadedCheckpoint and not jevCompatible and fileExists(jevProgressPath) and
+    readFile(jevProgressPath).splitLines().len > 2:
+-  # Keep the previous curve and settings (do not splice unlike MA20 windows).
++  # Keep the previous curve and settings (do not splice unlike Jev windows).
+   # A failed archive must NOT be followed by destructive CSV initialization.
+   try:
+     if fileExists(previousJevProgressPath):
+@@ -10672,20 +10754,11 @@
+         fullSeen[jp] = true
+         fullIds.add(jp)
+ 
+-  if jevEnabled:
+-    for jp in allIds:
+-      if not fullSeen[jp] and
+-         (fusionMatch(population[jp], fusionArchive) >= 0 or
+-          ((iter+1) mod FUSION_INTERVAL == 0 and fusionMatch(population[jp], fusionAnchors) >= 0)):
+-        fullSeen[jp] = true
+-        fullIds.add(jp)
+-    for jp in allIds:
+-      if fullSeen[jp]: continue
+-      for pending in fusionPending:
+-        if iter <= pending.due and sameGenomeContent(population[jp], pending.genome):
+-          fullSeen[jp] = true
+-          fullIds.add(jp)
+-          break
++  # v33: Jev snapshots are FULL-protected only when fusionInject deliberately
++  # places them in the protected prefix. Exact archive/pending matches that
++  # happen to survive naturally no longer receive an invisible FULL-evaluation
++  # privilege for up to twenty generations. This keeps G-selection and Jev
++  # calibration responsibilities separate.
+   var fastIds: seq[int] = @[]
+   for jp in allIds:
+     if not fullSeen[jp]:
+@@ -11374,75 +11447,92 @@
+     let target = min(jevModelCount, fullOrder.len)
+     var jevCandidates: seq[int] = @[]
+     var selected = initHashSet[int]()
++    # Historical repeats are useful for trust/calibration but must not inflate
++    # the plotted "current population" Jev metric. Pending children have never
++    # been Jev-scored, so they remain fresh observations.
++    var repeatIds = initHashSet[int]()
++    var anchorAdded = 0
++    var pendingAdded = 0
++    var frontRepeatAdded = 0
++    var meritAdded = 0
++    var exploreAdded = 0
+ 
+-    # Exact anchors and pending offspring precede merit selection. No parent
+-    # score is assigned to an offspring. Hash collisions are resolved by content.
+-    var hallCandidates: seq[int] = @[]
+-    for anchor in fusionAnchors:
+-      if jevCandidates.len >= target: break
++    proc addExactGenome(g: Genome, fp: Hash, historicalRepeat: bool): bool =
++      if jevCandidates.len >= target: return false
+       for id in fullOrder:
+-        if id notin selected and fullFp[id] == anchor.fingerprint and
+-           sameGenomeContent(population[id], anchor.genome):
+-          hallCandidates.add(id)
++        if id notin selected and fullFp[id] == fp and
++           sameGenomeContent(population[id], g):
+           selected.incl(id)
+           jevCandidates.add(id)
+-          break
++          if historicalRepeat: repeatIds.incl(id)
++          return true
++      false
++
++    # Stable 64-model composition under the 20-generation cadence:
++    #   <=8 repeat anchors, <=8 unmeasured nursery children, <=8 prior-front
++    #   repeats, 24 GA-merit genomes, and at least 16 broad-rank exploration
++    #   genomes when all repeat lanes are populated. This prevents calibration
++    #   traffic from silently consuming the entire exploration half of Jev.
++    for anchor in fusionAnchors:
++      if anchorAdded >= min(FUSION_ANCHORS, target): break
++      if addExactGenome(anchor.genome, anchor.fingerprint, true): inc anchorAdded
++
+     for pending in fusionPending:
+-      let pendingFp = genomeFingerprint(pending.genome)
+-      for id in fullOrder:
+-        if jevCandidates.len >= target: break
+-        if id notin selected and fullFp[id] == pendingFp and
+-           sameGenomeContent(population[id], pending.genome):
+-          selected.incl(id)
+-          jevCandidates.add(id)
+-          break
+-    for member in fusionArchive:
+-      for id in fullOrder:
+-        if jevCandidates.len >= target: break
+-        if id notin selected and fullFp[id] == member.fingerprint and
+-           sameGenomeContent(population[id], member.genome):
+-          selected.incl(id)
+-          jevCandidates.add(id)
+-          break
++      if pendingAdded >= min(FUSION_NURSERY, target): break
++      if pending.due != iter: continue
++      let fp = genomeFingerprint(pending.genome)
++      if addExactGenome(pending.genome, fp, false): inc pendingAdded
+ 
+-    # Merit lane: at most half the cohort. This protects ordinary GA winners
+-    # without allowing the GA score to monopolize the Jev observation set.
+-    let meritTarget = min(target - jevCandidates.len, max(1, target div 2))
+-    var meritAdded = 0
++    let frontRepeatTarget = min(JEV_SURVIVOR_SLOTS, min(fusionArchive.len, target))
++    for k in 0 ..< frontRepeatTarget:
++      if jevCandidates.len >= target: break
++      let pos = if frontRepeatTarget <= 1: fusionArchive.len - 1
++                else: k * (fusionArchive.len - 1) div (frontRepeatTarget - 1)
++      let member = fusionArchive[pos]
++      if addExactGenome(member.genome, member.fingerprint, true):
++        inc frontRepeatAdded
++
++    let meritQuota = max(1, (target * 3) div 8)
+     for id in fullOrder:
+-      if meritAdded >= meritTarget: break
++      if meritAdded >= meritQuota or jevCandidates.len >= target: break
+       if id notin selected:
+         jevCandidates.add(id)
+         selected.incl(id)
+         inc meritAdded
+ 
+-    # Exploration lane: evenly sample the ENTIRE remaining FULL ranking. This
+-    # is cheap, deterministic, and prevents 64 Jev evaluations from collapsing
+-    # onto one narrow high-GA lineage.
++    # Evenly sample the entire remaining FULL ranking. With 64 candidates and
++    # all three repeat lanes full this receives 16 slots; missing repeats enlarge
++    # exploration rather than being converted into still more top-GA models.
+     let remaining = target - jevCandidates.len
+     if remaining > 0:
+       var remainder: seq[int] = @[]
+       for id in fullOrder:
+         if id notin selected: remainder.add(id)
+-      for j in 0 ..< min(remaining, remainder.len):
+-        let pos = if remaining <= 1: 0
+-                  else: (j * (remainder.len - 1)) div max(1, remaining - 1)
++      let take = min(remaining, remainder.len)
++      for j in 0 ..< take:
++        let pos = if take <= 1: 0
++                  else: (j * (remainder.len - 1)) div max(1, take - 1)
+         let id = remainder[pos]
+         if id notin selected:
+           jevCandidates.add(id)
+           selected.incl(id)
+-    # Defensive fill for quantile collisions/short lists.
++          inc exploreAdded
++    # Defensive fill for short lists or integer-quantile collisions. These are
++    # fresh current-population observations, not historical repeats.
+     if jevCandidates.len < target:
+       for id in fullOrder:
+         if jevCandidates.len >= target: break
+         if id notin selected:
+           jevCandidates.add(id)
+           selected.incl(id)
+-    if hallCandidates.len > 0:
+-      echo "  jev-hall: scheduled_repeat_candidates=", hallCandidates.len
+-    echo "  jev-cohort: merit=", meritAdded,
+-         " hall_repeat=", hallCandidates.len,
+-         " broad_explore=", jevCandidates.len - meritAdded - hallCandidates.len
++          inc exploreAdded
++
++    echo "  jev-cohort: anchors=", anchorAdded,
++         " pending_fresh=", pendingAdded,
++         " front_repeat=", frontRepeatAdded,
++         " merit=", meritAdded,
++         " broad_explore=", exploreAdded,
++         " fresh_metric=", jevCandidates.len - repeatIds.len
+     echo "  jev: selected ", jevCandidates.len, "/", jevModelCount,
+          " FULL candidates for full Jev scoring and KwikSort"
+     let jevStarted = epochTime()
+@@ -11489,37 +11579,48 @@
+         let id = uniqueGenomes[pos]
+         fusionAnchors.add(fusionSnapshot(population[id], qualityById[id], iter))
+       fusionPending.setLen(0)
++      fusionPendingSeen = 0
+       echo "  jev-fusion: trust=", formatFloat(fusionReliability, ffDecimal, 3),
+            " repeat_pairs=", oldRepeat.len, " evidence_rounds=", fusionEvidence,
+            " repeat_noise=", fusionNoise, " front=", fusionArchive.len
++      # Progress should describe the CURRENT outer population, not be inflated
++      # by deliberately reinserted historical anchors/front points. Keep those
++      # repeats in the API ranking for calibration, but exclude them from the
++      # plotted rank-weighted quality. Pending children are fresh and included.
++      var freshRanked: seq[int] = @[]
++      for id in jevResult.ranked:
++        if id notin repeatIds: freshRanked.add(id)
++      if freshRanked.len == 0:
++        freshRanked = jevResult.ranked
++
+       var topQualitySum = 0.0
+-      var topQualityCount = 0
+-      for rank, id in jevResult.ranked:
+-        if rank < JEV_HALL_TOP_FINISH:
+-          topQualitySum += qualityById[id]
+-          inc topQualityCount
+-      let topQuality = if topQualityCount > 0: topQualitySum / float(topQualityCount) else: 0.0
+-      # Give each candidate's externally scored quality a LINEAR rank weight.
+-      # Rank 1 gets N, rank N gets 1 (for N candidates: N, N-1, ..., 1).
+-      # The mean is computed within this successful Jev round; MA20 then
+-      # averages these round-level weighted means across the last 20 observations.
+-      # Neither the Jev ranking used for selection nor the GA fitness changes.
++      let freshTopCount = min(JEV_HALL_TOP_FINISH, freshRanked.len)
++      for rank in 0 ..< freshTopCount:
++        topQualitySum += qualityById[freshRanked[rank]]
++      let topQuality = if freshTopCount > 0:
++                         topQualitySum / float(freshTopCount) else: 0.0
++
+       var rankWeightedSum = 0.0
+       var rankWeightTotal = 0.0
+-      for rank, id in jevResult.ranked:
+-        let weight = float(jevResult.ranked.len - rank)
++      var freshMeanSum = 0.0
++      for rank, id in freshRanked:
++        let weight = float(freshRanked.len - rank)
+         rankWeightedSum += weight * qualityById[id]
+         rankWeightTotal += weight
+-      let rankWeightedQuality = rankWeightedSum / rankWeightTotal
++        freshMeanSum += qualityById[id]
++      let rankWeightedQuality = rankWeightedSum / max(1.0, rankWeightTotal)
++      let freshMean = freshMeanSum / float(max(1, freshRanked.len))
+       let jevMA = jevAverage(jevHistory, rankWeightedQuality)
+       jevHistory.add(JevPoint(generation: iter,
+         quality: rankWeightedQuality, average: jevMA))
+       writeJevProgress(jevProgressPath, jevHistory)
+       jevMetricUpdated = true
+-      echo "  jev: quality_rank_weighted=", rankWeightedQuality,
+-           " cohort_mean=", jevResult.meanQuality,
+-           " top8_quality=", topQuality,
+-           " rank_weighted_ma20=", jevMA, " ranked=", jevRankedIds.len,
++      echo "  jev: fresh_quality_rank_weighted=", rankWeightedQuality,
++           " fresh_mean=", freshMean,
++           " cohort_mean_all=", jevResult.meanQuality,
++           " fresh_top8_quality=", topQuality,
++           " rank_weighted_ma", JEV_MA_WINDOW, "=", jevMA,
++           " fresh_ranked=", freshRanked.len, " front=", jevRankedIds.len,
+            " comparisons=", jevResult.pairComparisons,
+            " requests=", jevResult.apiRequests,
+            " local_evaluations=", jevResult.localEvaluations,
+@@ -11530,9 +11631,14 @@
+            " max_score_ms=", formatFloat(jevResult.maxScoreSeconds * 1000.0, ffDecimal, 1),
+            " seconds=", formatFloat(jevWallSeconds, ffDecimal, 3)
+     else:
+-      fusionReliability *= 0.5
+-      fusionPending.setLen(0) # no indefinite protection after API failure
+-      echo "  jev: unavailable; trust decayed; ordinary GA remains active"
++      # Availability failure is not evidence that the Jev rubric became noisy.
++      # With a 20-generation cadence, halving trust on one bridge/API timeout
++      # would erase months of repeat evidence and then wait 20 more generations
++      # for another measurement. Keep epistemic trust unchanged; stale influence
++      # still decays to zero automatically through fusionFreshness().
++      fusionPending.setLen(0)
++      fusionPendingSeen = 0
++      echo "  jev: unavailable; trust unchanged, stale influence decays; ordinary GA remains active"
+ 
+   # Exact telescoping decomposition, not an accumulated 'corrected' score:
+   # best_now - best_previous = dataset_delta + selection_gain.
+@@ -11902,17 +12008,23 @@
+         break
+   var capacityFallbacks = 0
+   var jevDonorPool: seq[int] = @[]
+-  if jevEnabled and fusionReliability > 0.0:
++  let jevFreshness = if jevEnabled: fusionFreshness(iter) else: 0.0
++  let jevInfluence = if jevEnabled: fusionInfluence(iter) else: 0.0
++  if jevEnabled and jevInfluence > 0.0:
+     var currentPoints: seq[FusionPoint] = @[]
+     for id in parentPool:
+       let fi = fusionMatch(population[id], fusionArchive)
+-      if fi >= 0 and iter - fusionArchive[fi].generation < FUSION_INTERVAL:
++      if fi >= 0 and fusionFreshness(iter) > 0.0:
+         currentPoints.add(FusionPoint(id: id, g: accs[id], j: fusionArchive[fi].quality))
+     for pos in fusionFront(currentPoints, FUSION_CAP):
+       jevDonorPool.add(currentPoints[pos].id)
+   var jevDonorChildren = 0
+-  let jevDonorRate = int(round(25.0 * fusionReliability))
+-  let nurseryCap = min(FUSION_NURSERY, int(round(FUSION_NURSERY.float*fusionReliability)))
++  # v32's 25% stayed flat until the next observation. At a 20-generation Jev
++  # interval that makes old external evidence dominate ~5x longer than intended.
++  # Reliability controls epistemic authority; freshness controls temporal age.
++  let jevDonorRate = int(round(float(JEV_MAX_DONOR_PERCENT) * jevInfluence))
++  let nurseryCap = min(FUSION_NURSERY,
++    int(round(FUSION_NURSERY.float * fusionReliability)))
+   var diversePairs = 0
+   var measuredPairs = 0
+   if parentPool.len >= 2:
+@@ -11952,6 +12064,12 @@
+        " asexual%=", asexualPercentGen,
+        " macro_mutation%=", explorationPercentGen,
+        " crossover_macro%=", CROSSOVER_MACRO_PERCENT
++  if jevEnabled:
++    echo "  jev-influence: trust=", formatFloat(fusionReliability, ffDecimal, 3),
++         " freshness=", formatFloat(jevFreshness, ffDecimal, 3),
++         " effective=", formatFloat(jevInfluence, ffDecimal, 3),
++         " donor%=", jevDonorRate, " survivor_cap=", JEV_SURVIVOR_SLOTS,
++         " nursery_cap=", nurseryCap
+ 
+   # この世代の先頭で次世代へそのまま継ぐ個体数を正確に覚える。
+   # archiveが8件埋まらなかった場合に、ただの子個体まで次世代FULL保護しない。
+@@ -12179,14 +12297,25 @@
+     # or an asexual clone may have discarded the initially selected Jev donor.
+     if p1i in jevDonorPool or (didCrossover and p2i in jevDonorPool):
+       inc jevDonorChildren
+-    if fusionMating and fusionPending.len < nurseryCap:
+-      # A distinct unmeasured child gets one bounded chance at the NEXT Jev.
+-      var duplicate = fusionMatch(child, fusionArchive) >= 0
++    if fusionMating and nurseryCap > 0:
++      # Reservoir-sample distinct, unmeasured Jev-mating children across the
++      # whole 20-generation interval. The old first-N policy permanently kept
++      # the earliest children and ignored everything discovered later. Snapshots
++      # stay off-population until their one due Jev round.
++      var duplicate = fusionMatch(child, fusionArchive) >= 0 or
++                      fusionMatch(child, fusionAnchors) >= 0
+       for pending in fusionPending:
+         if sameGenomeContent(child, pending.genome): duplicate = true
+       if not duplicate:
++        inc fusionPendingSeen
+         let due = ((iter + 1) div FUSION_INTERVAL + 1)*FUSION_INTERVAL - 1
+-        fusionPending.add(FusionPending(genome: cloneGenome(child), due: due))
++        let candidate = FusionPending(genome: cloneGenome(child), due: due)
++        if fusionPending.len < nurseryCap:
++          fusionPending.add(candidate)
++        else:
++          let reservoirIndex = rand(fusionPendingSeen - 1)
++          if reservoirIndex < nurseryCap:
++            fusionPending[reservoirIndex] = candidate
+     offspringBuckets.mgetOrPut(childFingerprint, @[]).add(new_population.len)
+     new_population.add(child)
+ 

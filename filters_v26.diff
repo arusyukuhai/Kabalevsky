@@ -1,0 +1,427 @@
+--- /tmp/before.nim	2026-09-25 15:53:44.710869261 +0900
++++ work/jev_embedding256/at_jev.nim	2026-09-25 15:55:30.168998220 +0900
+@@ -14,6 +14,7 @@
+ # v23: shrink that space to 512 symbols (256 mapped + 256 latent); arithmetic
+ #      closes modulo 512 and the sparse two-token candidate index is retained.
+ # v25: 256-token permutation; adaptive fusion and v24 migration.
++# v26/V11: four new capture filters; v25 objective and history preserved.
+ # Audit: bounded parent pools, exact-duplicate rescue, cached distance minima.
+ # Build: nim c -d:release --threads:on at.nim
+ # Verify: ./at --regression-test && ./at --self-test
+@@ -1057,9 +1058,9 @@
+     elif t >= -47:
+       plan.allLiteral = false
+       plan.ops[i] = ReplacementOp(kind: 3'u8, arg: uint8(-t - 32), value: 0)
+-    elif t >= -111:
+-      # Four contiguous banks of 16 captures, preserving all old opcodes:
+-      # -48..-63 +1; -64..-79 -1; -80..-95 *2; -96..-111 //2.
++    elif t >= -175:
++      # Eight contiguous banks of 16 captures, preserving all old opcodes:
++      # -48..-111: +1, -1, *2, //2; -112..-175: negate, mean, median, contract.
+       plan.allLiteral = false
+       let offset = -t - 48
+       plan.ops[i] = ReplacementOp(
+@@ -1214,17 +1215,17 @@
+       let dst = outp.len
+       outp.setLen(dst + c.len)
+       case op.kind
+-      of 4'u8: # +1 modulo 512 within the internal-token domain
++      of 4'u8: # +1 modulo the vocabulary size within the internal-token domain
+         for j in 0 ..< c.len:
+           let v = input[c.start + j]
+           outp[dst + j] = (if v >= 0 and v < EMBEDDING_CODE_COUNT:
+                             (v + 1) mod EMBEDDING_CODE_COUNT else: v)
+-      of 5'u8: # -1 modulo 512 within the internal-token domain
++      of 5'u8: # -1 modulo the vocabulary size within the internal-token domain
+         for j in 0 ..< c.len:
+           let v = input[c.start + j]
+           outp[dst + j] = (if v >= 0 and v < EMBEDDING_CODE_COUNT:
+                             (v + EMBEDDING_CODE_COUNT - 1) mod EMBEDDING_CODE_COUNT else: v)
+-      of 6'u8: # *2 modulo 512 within the internal-token domain
++      of 6'u8: # *2 modulo the vocabulary size within the internal-token domain
+         for j in 0 ..< c.len:
+           let v = input[c.start + j]
+           outp[dst + j] = (if v >= 0 and v < EMBEDDING_CODE_COUNT:
+@@ -1239,6 +1240,52 @@
+             outp[dst + j] = (if v < 0 and v mod 2 != 0: q - 1 else: q)
+       else:
+         discard
++    of 8'u8 .. 11'u8:
++      # New capture filters: length-preserving, with no parent/cache mutation.
++      var n = int(op.arg)
++      if wildcardCount == 0 or captures.len == 0: continue
++      if n >= wildcardCount or n >= captures.len: n = 0
++      let c = captures[n]
++      if c.start < 0 or c.len < 0 or c.start > input.len or
++          c.len > input.len - c.start:
++        raise newException(SeqReplaceError, "invalid capture in aggregate filter")
++      if c.len > maxOutput - outp.len:
++        overflow = true
++        return
++      if c.len == 0: continue
++      let dst = outp.len
++      outp.setLen(dst + c.len)
++      if op.kind == 8'u8:
++        for j in 0 ..< c.len:
++          let v = input[c.start + j]
++          # As with +1/-1/*2, preserve the OOV sentinel.
++          outp[dst + j] = (if v >= 0 and v < EMBEDDING_CODE_COUNT:
++            (EMBEDDING_CODE_COUNT - v) mod EMBEDDING_CODE_COUNT else: v)
++      elif op.kind == 10'u8:
++        # Reuse the existing worker-local buffer; no per-call allocation
++        # once capacity is sufficient. Even-length median averages both centres.
++        scratch.sortBuf.setLen(c.len)
++        copyMem(addr scratch.sortBuf[0], unsafeAddr input[c.start], c.len * sizeof(int))
++        sort(scratch.sortBuf)
++        let mid = c.len div 2
++        let twice = int64(scratch.sortBuf[mid]) + int64(scratch.sortBuf[(c.len - 1) div 2])
++        let value = int(twice div 2 - (if twice < 0 and twice mod 2 != 0: 1 else: 0))
++        for j in 0 ..< c.len: outp[dst + j] = value
++      else:
++        var total = 0'i64
++        for j in 0 ..< c.len: total += int64(input[c.start + j])
++        let count = int64(c.len)
++        if op.kind == 9'u8:
++          let value = int(total div count - (if total < 0 and total mod count != 0: 1 else: 0))
++          # Unconditional: every position, including OOV, becomes the mean.
++          for j in 0 ..< c.len: outp[dst + j] = value
++        else:
++          let denominator = 2 * count
++          for j in 0 ..< c.len:
++            # floor((x + exact_mean)/2), rounding ONCE, using integer arithmetic.
++            let numerator = int64(input[c.start + j]) * count + total
++            outp[dst + j] = int(numerator div denominator -
++              (if numerator < 0 and numerator mod denominator != 0: 1 else: 0))
+     else:
+       raise newException(SeqReplaceError, "Unknown replacement opcode")
+ 
+@@ -2150,6 +2197,8 @@
+   ## -64..-79 = ($1..$16) - 1 (mod 256 on internal tokens)
+   ## -80..-95 = ($1..$16) * 2 (mod 256 on internal tokens)
+   ## -96..-111 = ($1..$16) // 2 (integer floor)
++  ## -112..-127 = modular negation; -128..-143 = mean fill
++  ## -144..-159 = median fill; -160..-175 = contraction about exact mean
+   ##
+   ## ★変更: 直値(literal)は以前 0..256 の完全一様乱数だったが、
+   ## コーパス出現頻度に比例したサンプリングへ変更した。
+@@ -2211,7 +2260,7 @@
+ # The original direct-reference bank has 15 entries; all function banks
+ # have 16. Decode/re-encode in one place to avoid inconsistent validity
+ # checks (and accidentally discarding novel opcodes during crossover/load).
+-const MIN_REPLACEMENT_OPCODE = -111
++const MIN_REPLACEMENT_OPCODE = -175
+ 
+ proc replacementCaptureNumber(opcode: int): int {.inline.} =
+   if opcode >= -15:
+@@ -2301,7 +2350,7 @@
+   # a many-generation search to discover them by chance. No extra rows.
+   let wc = countWildcards(a)
+   if wc > 0 and b.len > 0 and rand(99) < 20:
+-    let family = rand(6)  # direct, sort, reverse, +1, -1, *2, //2
++    let family = rand(10) # direct + ten transform families
+     let maxCapture = (if family == 0: min(wc, 15) else: min(wc, 16))
+     let captureNumber = 1 + rand(maxCapture - 1)
+     let opcode = (if family == 0: -captureNumber
+@@ -2815,6 +2864,9 @@
+     let (l, r) = sampleCrossoverSegment(n)
+     result = twoPointGenomeCrossover(p1, p2, l, r)
+     return
++  if op == coTwoPoint:
++    let (l, r) = sampleCrossoverSegment(n)
++    return twoPointGenomeCrossover(p1, p2, l, r)
+   let plan = prepareRuleTransplant(p2[0].embedding, p1[0].embedding)
+   case op
+   of coTwoPoint:
+@@ -2967,16 +3019,11 @@
+   let r = rand(99)
+   if r < 50:
+     return -(1 + rand(14))          # $1..$15
+-  let family =
+-    (if r < 60: 0                  # sort
+-     elif r < 70: 1                # reverse
+-     elif r < 78: 2                # +1
+-     elif r < 86: 3                # -1
+-     elif r < 93: 4                # *2
+-     else: 5)                      # //2
++  let family = rand(9)             # sort/reverse/arithmetic/aggregate (10 banks)
+   -(16 + family * 16 + rand(15))   # captures $1..$16
+ 
+ 
++
+ proc mutateSequence(x: var seq[int], makePattern: bool, embedding: seq[int] = @[]) =
+   ## Exactly one model token per byte. Keep atomic capture/function opcodes.
+   ## Log-uniform counts remain controlled by mutateGenome, unchanged.
+@@ -3410,19 +3457,34 @@
+   # Pattern/replacement mutation uses the same log-uniform target count.
+   if not majorMutationUsed and rand(100) < int(min(60.0, 26.0 * s)):
+     for p in pickMutationTargets(g):
+-      g[p].a = cloneInts(g[p].a)
+-      mutateSequence(g[p].a, true, inheritedEmbedding)
+-      sanitizePatternWildcards(g[p])
+-      g[p].patternRevision = freshPatternRevision()
+-      if rand(100) < 65:
++      let replacementOnly = rand(99) < 35
++      if not replacementOnly:
++        g[p].a = cloneInts(g[p].a)
++        mutateSequence(g[p].a, true, inheritedEmbedding)
++        sanitizePatternWildcards(g[p])
++        g[p].patternRevision = freshPatternRevision()
++      if replacementOnly or rand(100) < 65:
+         g[p].b = cloneInts(g[p].b)
+-        mutateSequence(g[p].b, false, inheritedEmbedding)
++        var filterPositions: seq[int] = @[]
++        if replacementOnly:
++          for j, v in g[p].b:
++            if v < 0 and v >= MIN_REPLACEMENT_OPCODE: filterPositions.add(j)
++        if filterPositions.len > 0 and rand(99) < 70:
++          let j = filterPositions[rand(filterPositions.len - 1)]
++          let old = g[p].b[j]
++          let capture = replacementCaptureNumber(old)
++          let oldFamily = if old >= -15: 0 else: 1 + (-old - 16) div 16
++          let firstFamily = if capture == 16: 1 else: 0
++          # Uniform over OTHER valid families: always a real operator change.
++          var family = firstFamily + rand(9 - firstFamily)
++          if family >= oldFamily: inc family
++          g[p].b[j] = if family == 0: -capture
++                     else: -(16 + (family - 1) * 16 + capture - 1)
++        else:
++          mutateSequence(g[p].b, false, inheritedEmbedding)
+         g[p].replacementRevision = freshReplacementRevision()
+-        # Editing b can create an opcode referring to a nonexistent capture.
+-        if replacementRefsNeedSanitize(g[p]):
+-          sanitizeReplacementRefs(g[p])
++        if replacementRefsNeedSanitize(g[p]): sanitizeReplacementRefs(g[p])
+       elif replacementRefsNeedSanitize(g[p]):
+-        ## aの変異でwildcard数が変わり、bのbackreferenceが不正になる場合。
+         g[p].b = cloneInts(g[p].b)
+         sanitizeReplacementRefs(g[p])
+     majorMutationUsed = true
+@@ -3476,7 +3538,7 @@
+       let src = rand(g.len - blockLen)
+       var dst = rand(g.len - blockLen)
+       if dst == src:
+-        dst = (dst + blockLen) mod (g.len - blockLen + 1)
++        dst = (src + 1 + rand(g.len - blockLen - 1)) mod (g.len - blockLen + 1)
+ 
+       if rand(1) == 0:
+         # block relocation: 全ruleを保ったまま区間を移動する。
+@@ -5608,7 +5670,7 @@
+     fixedMovingAvg: float
+ 
+ const CHECKPOINT_MAGIC = "KLEISMIC_GA_CHECKPOINT"
+-const CHECKPOINT_VERSION = 25
++const CHECKPOINT_VERSION = 26
+ const CHECKPOINT_OBJECTIVE_VERSION = 25 # 256-token objective
+ var migratedRuleCount = false
+ var loadedCheckpointVersion = 0
+@@ -6178,7 +6240,7 @@
+       raise newException(IOError, "Invalid checkpoint magic: " & path)
+ 
+     let version = int(fs.readInt64())
+-    if version < 3 or (version > 9 and version notin [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, CHECKPOINT_VERSION]):
++    if version < 3 or (version > 9 and version notin [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, CHECKPOINT_VERSION]):
+       raise newException(IOError, "Unsupported checkpoint version: " & $version)
+ 
+     nextIter = int(fs.readInt64())
+@@ -6562,7 +6624,8 @@
+ const ENERGY_MODEL_MAGIC_V7 = "KLEISMIC_ENERGY_V7"
+ const ENERGY_MODEL_MAGIC_V8 = "KLEISMIC_ENERGY_V8"
+ const ENERGY_MODEL_MAGIC_V9 = "KLEISMIC_ENERGY_V9"
+-const ENERGY_MODEL_MAGIC = "KLEISMIC_ENERGY_V10"
++const ENERGY_MODEL_MAGIC_V10 = "KLEISMIC_ENERGY_V10"
++const ENERGY_MODEL_MAGIC = "KLEISMIC_ENERGY_V11"
+ const GENERATION_ISLANDS = 4
+ const GENERATION_NGRAM_LIMIT = 512
+ # Text search must never inherit the 10-second TRAINING watchdog per proposal.
+@@ -6855,18 +6918,21 @@
+     let pos = rand(n - 1)
+     var alternative = pickGenerationToken(alphabet, cumulative)
+     if alternative == result[pos]:
+-      alternative = alphabet[(rand(alphabet.len - 2) + 1) mod alphabet.len]
++      let currentIndex = alphabet.find(result[pos])
++      let offset = rand(alphabet.len - 2)
++      alternative = alphabet[if currentIndex >= 0 and offset >= currentIndex: offset + 1 else: offset]
+     result[pos] = alternative
+ 
+ type EnergyModelData = tuple[genome: Genome, alphabet, frequencies: seq[int], grams: seq[GenerationGram]]
+ 
+ proc readEnergyModelBody(stream: Stream, header: string): EnergyModelData =
+-  if header notin [ENERGY_MODEL_MAGIC, ENERGY_MODEL_MAGIC_V9, ENERGY_MODEL_MAGIC_V8,
++  if header notin [ENERGY_MODEL_MAGIC, ENERGY_MODEL_MAGIC_V10, ENERGY_MODEL_MAGIC_V9, ENERGY_MODEL_MAGIC_V8,
+       ENERGY_MODEL_MAGIC_V7, ENERGY_MODEL_MAGIC_V6, ENERGY_MODEL_MAGIC_V5,
+       ENERGY_MODEL_MAGIC_V4, ENERGY_MODEL_MAGIC_V3, ENERGY_MODEL_MAGIC_V2, ENERGY_MODEL_MAGIC_V1]:
+-    raise newException(IOError, "Expected a V1..V10 .model file, not a GA checkpoint.")
++    raise newException(IOError, "Expected a V1..V11 .model file, not a GA checkpoint.")
+   let modelVersion =
+     if header == ENERGY_MODEL_MAGIC: CHECKPOINT_VERSION
++    elif header == ENERGY_MODEL_MAGIC_V10: 25
+     elif header == ENERGY_MODEL_MAGIC_V9: 24
+     elif header == ENERGY_MODEL_MAGIC_V8: 22
+     elif header == ENERGY_MODEL_MAGIC_V7: 21
+@@ -6918,11 +6984,13 @@
+   let prefix = stream.readStr(ENERGY_MODEL_MAGIC_V9.len)
+   if prefix == ENERGY_MODEL_MAGIC_V1:
+     let bodyStart = stream.getPosition()
+-    if stream.readStr(1) == "0":
+-      # A V1 genome length whose low byte is 48 also begins with ASCII '0'.
+-      # Accept V10 only after its complete body, mapping and alphabet validate.
++    let suffix = stream.readStr(1)
++    if suffix in ["0", "1"]:
++      # V1 rule counts 48/49 (and 304/305) collide with V10/V11 prefixes.
++      # Accept the longer header only after validating its complete body.
+       try:
+-        return readEnergyModelBody(stream, ENERGY_MODEL_MAGIC)
++        return readEnergyModelBody(stream,
++          if suffix == "0": ENERGY_MODEL_MAGIC_V10 else: ENERGY_MODEL_MAGIC)
+       except IOError:
+         discard
+     stream.setPosition(bodyStart)
+@@ -8158,7 +8226,7 @@
+     selectedOld.add(bestOld)
+     selectedNew.add(bestNew)
+   echo "PASS: incremental distance gives identical selected IDs; comparisons ",oldComparisons," -> ",scratch.comparisons
+-  for ruleCount in [1, 48, 304]:
++  for ruleCount in [1, 48, 49, 304, 305]:
+     let oldModel = newStringStream()
+     oldModel.write(ENERGY_MODEL_MAGIC_V1)
+     oldModel.write(ruleCount.int64)
+@@ -8186,7 +8254,7 @@
+     let paths=resolveCheckpointPaths(args)
+     doAssert paths.loadRequested and paths.loadPath=="old.bin" and paths.savePath=="new.bin"
+   doAssert resolveCheckpointPaths(@["--load=old.bin"]).savePath=="old.bin"
+-  echo "PASS: V1 headers (including ambiguous 48/304 rules), V10 model roundtrip, order-independent load/save"
++  echo "PASS: V1 headers (including ambiguous 48/49/304/305 rules), V11 model roundtrip, order-independent load/save"
+ 
+   var base=cloneGenome(pop[0])
+   var donor=cloneGenome(pop[1])
+@@ -8569,6 +8637,121 @@
+   echo "PASS: adaptive Jev trust, Pareto extremes, nursery expiry, genome identity, v25 roundtrip and v23 migration"
+   quit(0)
+ 
++if "--filter-test" in commandLineParams():
++  randomize(20260925)
++  var scratch: ReplaceScratch
++  proc applyFilter(xs: seq[int], opcode: int): seq[int] =
++    var plan: ReplacementPlan
++    compileReplacementPlan(@[opcode], plan)
++    var overflow = false
++    let captures = @[Capture(start: 0, len: xs.len)]
++    appendReplacementPlan(result, addr plan, xs, captures, 1, scratch, overflow)
++    doAssert not overflow
++  doAssert applyFilter(@[0, 1, 255, 256], -112) == @[0, 255, 1, 256]
++  doAssert applyFilter(@[0, 1, 8], -128) == @[3, 3, 3]
++  doAssert applyFilter(@[0, 1, 8], -144) == @[1, 1, 1]
++  doAssert applyFilter(@[0, 1, 8], -160) == @[1, 2, 5]
++  doAssert applyFilter(@[0, 3], -160) == @[0, 2] # no premature rounding
++  doAssert applyFilter(@[255, 256], -128) == @[255, 255] # unconditional OOV fill
++  doAssert applyFilter(@[255, 256], -144) == @[255, 255]
++  doAssert applyFilter(@[-3, 0], -128) == @[-2, -2]
++  doAssert applyFilter(@[-3, 0], -160) == @[-3, -1]
++  for trial in 0 ..< 1000:
++    var xs: seq[int]
++    for j in 0 ..< rand(128): xs.add(rand(EMBEDDING_CODE_COUNT))
++    var ordered = cloneInts(xs)
++    ordered.sort()
++    var total = 0.0
++    for x in xs: total += float(x)
++    for family in 0 .. 3:
++      let opcode = -112 - family * 16
++      let actual = applyFilter(xs, opcode)
++      doAssert actual.len == xs.len
++      for j, x in xs:
++        let expected = case family
++          of 0: (if x == EMBEDDING_OOV: x else: (EMBEDDING_CODE_COUNT-x) mod EMBEDDING_CODE_COUNT)
++          of 1: int(floor(total / float(xs.len)))
++          of 2: int(floor((float(ordered[xs.len div 2]) + float(ordered[(xs.len-1) div 2])) / 2.0))
++          else: int(floor((float(x) + total/float(xs.len))/2.0))
++        doAssert actual[j] == expected
++  # All sixteen captures, validity repair, output limits and invalid slices.
++  for family in 0 .. 3:
++    for cap in 1 .. 16:
++      let opcode = -112 - family * 16 - cap + 1
++      var plan: ReplacementPlan
++      compileReplacementPlan(@[opcode], plan)
++      doAssert int(plan.ops[0].arg) == cap-1 and int(plan.ops[0].kind) == 8+family
++      var captures: array[16, Capture]
++      for i in 0 .. 15: captures[i] = Capture(start:i, len:1)
++      var input: seq[int]
++      for i in 0 .. 15: input.add(i)
++      var output: seq[int]
++      var overflow = false
++      appendReplacementPlan(output,addr plan,input,captures,16,scratch,overflow)
++      doAssert output == applyFilter(@[cap-1], -112-family*16)
++      output.setLen(0)
++      appendReplacementPlan(output,addr plan,input,captures,16,scratch,overflow,0)
++      doAssert overflow and output.len == 0
++      captures[cap-1] = Capture(start:16,len:1)
++      var rejected = false
++      try: appendReplacementPlan(output,addr plan,input,captures,16,scratch,overflow)
++      except SeqReplaceError: rejected = true
++      doAssert rejected
++  var parent: Genome = @[]
++  for i in 0 ..< 16:
++    parent.add(Rule(a: @[-1, i], b: @[-1], weight: 0.5,
++      patternRevision:freshPatternRevision(),replacementRevision:freshReplacementRevision()))
++  parent[0].embedding = defaultEmbedding()
++  let snapshot = cloneGenome(parent)
++  var replacementOnlyCount = 0
++  var newFamilies: array[4, bool]
++  for trial in 0 ..< 2000:
++    var child = cloneGenome(parent)
++    mutateGenome(child)
++    doAssert sameGenomeContent(parent, snapshot)
++    for i, r in child:
++      doAssert compatibleRule(r)
++      if r.a == parent[i].a and r.b != parent[i].b: inc replacementOnlyCount
++      for v in r.b:
++        if v in -175 .. -112: newFamilies[(-v-112) div 16] = true
++  doAssert replacementOnlyCount > 0 and newFamilies.allIt(it)
++  # Transform opcodes survive every crossover without modifying either parent.
++  var donor = cloneGenome(parent)
++  for i in 0 ..< donor.len:
++    donor[i].b = @[-112 - (i mod 4)*16]
++    donor[i].replacementRevision = freshReplacementRevision()
++  let donorSnapshot = cloneGenome(donor)
++  for op in CrossoverOp:
++    let child = crossoverGenome(parent, donor, op, @[], @[])
++    for r in child: doAssert compatibleRule(r)
++    doAssert sameGenomeContent(parent,snapshot) and sameGenomeContent(donor,donorSnapshot)
++  for version in [25, CHECKPOINT_VERSION]:
++    let stream = newStringStream()
++    writeGenome(stream,donor)
++    stream.setPosition(0)
++    doAssert sameGenomeContent(donor,readGenome(stream,version))
++    stream.close()
++  for header in [ENERGY_MODEL_MAGIC_V10, ENERGY_MODEL_MAGIC]:
++    let stream = newStringStream()
++    stream.write(header)
++    writeGenome(stream, if header == ENERGY_MODEL_MAGIC_V10: parent else: donor)
++    writeIntSeq(stream,@[65,66])
++    writeIntSeq(stream,@[1,1])
++    stream.write(0'i64)
++    stream.setPosition(0)
++    let restored = readEnergyModel(stream)
++    doAssert sameGenomeContent(restored.genome, if header == ENERGY_MODEL_MAGIC_V10: parent else: donor)
++    stream.close()
++  # Even a collapsed proposal distribution must produce a genuinely new token.
++  for alphabet in [@[65,66], @[66,65], @[65,66,67]]:
++    var cumulative = newSeq[float](alphabet.len)
++    for i in 0 ..< cumulative.len: cumulative[i] = 1.0
++    let p1 = @[alphabet[0]]
++    for trial in 0 ..< 100:
++      doAssert generationOffspring(p1,p1,2,1,alphabet,cumulative,@[]) != p1
++  echo "PASS: 4000 randomized filter comparisons, all 16 captures, bounds/OOV/rounding, 2000 mutation trials, crossover immutability, V10/V11 roundtrips, real offspring novelty"
++  quit(0)
++
+ if "--regression-test" in commandLineParams():
+   doAssert INPUT_BYTE_COUNT == 256
+   doAssert EMBEDDING_ENTRY_COUNT == 256
+@@ -9162,7 +9345,7 @@
+   doAssert not compatibleRule(ref16)
+   sanitizeReplacementRefs(ref16)
+   doAssert compatibleRule(ref16) and ref16.b == @[-48, -64, -80, -96]
+-  var badOpcode = testRule(@[97], @[-112], 0.5)
++  var badOpcode = testRule(@[97], @[-176], 0.5)
+   doAssert not compatibleRule(badOpcode)
+   badOpcode.b = @[98]
+   doAssert compatibleRule(badOpcode)

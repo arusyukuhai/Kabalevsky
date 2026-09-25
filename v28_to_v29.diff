@@ -1,0 +1,514 @@
+--- at_jev_v28_backup.nim	2026-09-25 07:46:18.277656110 +0000
++++ at_jev.nim	2026-09-25 07:52:26.171442536 +0000
+@@ -19,6 +19,10 @@
+ # v28: stabilize GP refinement: six 20-point cases, slower one-slot rolling,
+ #      semantically exact FAST rounds, bounded local mutations, and wider
+ #      crossover traces. The raw-byte diffusion domain is strictly 0..255.
++# v29: refinement pass: preserve rank resolution inside each 20-point case,
++#      rotate FAST observations, enforce a shared local mutation budget, keep
++#      embedding edits out of exploitation, and separate local from macro
++#      crossover/exploration pressure.
+ # Audit: bounded parent pools, exact-duplicate rescue, cached distance minima.
+ # Build: nim c -d:release --threads:on at.nim
+ # Verify: ./at --regression-test && ./at --self-test
+@@ -2039,15 +2043,25 @@
+                   else:
+                     op = DIFF_OP_REPLACE_BLOCK
+ 
+-    discard applyDiffusionKernel(state, base, op, progress)
+-    # 操作回数deltaではなく、実際のstateとbaseの距離を推定して
+-    # diffusion target y を更新する。これにより、例えば
+-    # 「1回のalphabet置換で大量に変わる」ケースと
+-    # 「10回の無効に近い操作」の区別がつく。
+-    diffusionMass = clampDiffScore(
+-      estimateDiffusionDamage(base, state, diffusionMass),
+-      base.len - 1
+-    )
++    # Spearman on 20 observations loses a surprising amount of resolution if
++    # several adjacent samples receive the same target rank.  A corruption can
++    # legitimately be a no-op (or undo earlier positional damage), so give the
++    # step a few bounded extra kernel applications before accepting a duplicate
++    # damage level.  This does NOT fabricate labels: y is still computed from
++    # the actual resulting state.  It merely spends dataset-construction work
++    # to make the 20 retained observations carry more rank information.
++    var attempts = 0
++    var nextDamage = diffusionMass
++    while attempts < 4:
++      discard applyDiffusionKernel(state, base, op, progress)
++      nextDamage = clampDiffScore(
++        estimateDiffusionDamage(base, state, diffusionMass),
++        base.len - 1
++      )
++      inc attempts
++      if nextDamage != diffusionMass or diffusionMass >= base.len - 1:
++        break
++    diffusionMass = nextDamage
+ 
+     result.x.add(cloneInts(state))
+     result.y.add(max(1, base.len - diffusionMass))
+@@ -2869,18 +2883,27 @@
+   else:
+     result += 0.15  # both modules can end at the genome boundary
+ 
+-proc sampleCrossoverLength(n: int): int =
++const LOCAL_CROSSOVER_MAX_RULES = 96
++const CROSSOVER_MACRO_PERCENT = 12
++
++proc sampleCrossoverLength(n: int, maxLen: int = high(int)): int =
+   if n <= 1: return max(0, n)
+-  result = max(1, min(n, int(round(exp(rand(ln(float(n))))))))
++  let upper = min(n, max(1, maxLen))
++  if upper <= 1: return upper
++  # Same log-uniform family as mutation counts. Kept self-contained because the
++  # generic mutation sampler is declared later in the file.
++  result = max(1, min(upper, int(round(exp(rand(ln(float(upper))))))))
+ 
+ proc sampleCrossoverSegment(n: int): tuple[l, r: int] =
+-  ## Usually import one log-uniform contiguous block; occasionally retain the
+-  ## classic uniformly selected two-point interval for genuine macro mixing.
++  ## Most ordinary crossover is a local building-block transfer. A bounded
++  ## macro lane remains explicit rather than letting every two-point crossover
++  ## silently draw from the entire 1500-rule genome.
+   if n <= 0: return (0, 0)
+-  if rand(99) < 80:
+-    let length = sampleCrossoverLength(n)
++  if rand(99) >= CROSSOVER_MACRO_PERCENT:
++    let length = sampleCrossoverLength(n, LOCAL_CROSSOVER_MAX_RULES)
+     let l = rand(n - length)
+     return (l, l + length)
++  # Genuine macro mixing: retain a full-range two-point interval.
+   let l = rand(n - 1)
+   let r = l + 1 + rand(n - l - 1)
+   (l, r)
+@@ -2930,7 +2953,7 @@
+       return twoPointGenomeCrossover(p1, p2, l, r)
+     else:
+       result = cloneGenome(p1)
+-      let count = sampleCrossoverLength(matched.len)
++      let count = sampleCrossoverLength(matched.len, LOCAL_CROSSOVER_MAX_RULES)
+       let start = rand(matched.len - count)
+       for mi in start ..< start + count:
+         let a = matched[mi].base
+@@ -2950,7 +2973,7 @@
+       if t2[i].hits > 0: active.add(i)
+     # Prefer a champion-derived contiguous functional module when the same
+     # a/b signature is present in this donor at its recorded source site.
+-    # Otherwise use a trace-active source and full-range log-uniform length.
++    # Otherwise use a trace-active source and locally bounded log-uniform length.
+     var guidedSources: seq[int] = @[]
+     if guidedModules.len > 0 and guidedReferenceGenome.len > 0 and
+         p1[0].embedding == p2[0].embedding and
+@@ -2965,7 +2988,7 @@
+             valid = false
+             break
+         if valid: guidedSources.add(mi)
+-    var length = sampleCrossoverLength(n)
++    var length = sampleCrossoverLength(n, LOCAL_CROSSOVER_MAX_RULES)
+     var src = rand(n - length)
+     if guidedSources.len > 0 and rand(99) < 40:
+       let m = guidedModules[guidedSources[rand(guidedSources.len - 1)]]
+@@ -2994,8 +3017,9 @@
+         result[bestDst + j] = transplantRulePlanned(p2[src + j], plan)
+   of coMacro:
+     result = cloneGenome(p1)
+-    # Non-homologous, full-range exploration: a single log-uniform block.
+-    let length = sampleCrossoverLength(n)
++    # Explicit non-homologous full-range exploration. Macro size remains
++    # log-uniform over 1..N; ordinary crossover operators are locally bounded.
++    let length = sampleCrossoverLength(n, n)
+     let src = rand(n - length)
+     let dst = if rand(99) < 85: src else: rand(n - length)
+     let reversed = rand(99) < 2
+@@ -3008,9 +3032,11 @@
+   for i in 1 ..< result.len: result[i].embedding = @[]
+ 
+ proc chooseCrossoverOp(preference: array[CrossoverOp, float]): CrossoverOp =
+-  ## 40% minimum uniform exploration + 60% softmax allocation.
++  ## Every operator is probed with an exact paired FULL evaluation each
++  ## generation, so reproduction itself does not need a 40% blind exploration
++  ## tax. Keep a 20% floor and let the remaining 80% follow measured utility.
+   ## Runtime-only preferences reset on resume: no checkpoint format change.
+-  if rand(1.0) < 0.40:
++  if rand(1.0) < 0.20:
+     return CrossoverOp(rand(CROSSOVER_OP_COUNT - 1))
+   var weights: array[CrossoverOp, float]
+   var total = 0.0
+@@ -3337,6 +3363,18 @@
+       v = 0.0
+     result[i] = (v)
+ 
++proc pickMutationTargetsBudget(g: Genome, remaining: var int): seq[int] =
++  ## A local child gets one shared rule-edit budget.  Each triggered operator
++  ## still samples a log-uniform count, but sequential operators spend from the
++  ## same budget instead of each independently receiving the full allowance.
++  ## This removes the hidden K+K+K amplification that used to turn a nominal
++  ## 32-rule local mutation into a much larger semantic jump.
++  if remaining <= 0 or g.len == 0:
++    return @[]
++  result = pickMutationTargets(g, min(g.len, remaining))
++  remaining = max(0, remaining - result.len)
++
++
+ proc mutateWeightFFT(g: var Genome) =
+   if g.len < 4:
+     return
+@@ -3485,6 +3523,8 @@
+     return
+   let inheritedEmbedding = g[0].embedding
+   let countCap = min(g.len, max(1, mutationCountCap))
++  var remainingBudget = countCap
++  let macroLane = countCap >= g.len
+ 
+   # No temporal or branch allele: only a/b/weight may mutate.
+ 
+@@ -3497,17 +3537,20 @@
+   var majorMutationUsed = false
+ 
+   # Row swaps draw their affected-rule count from the lane's logarithmic range.
+-  if not majorMutationUsed and rand(100) < int(min(45.0, 14.0 * s)):
++  if remainingBudget > 0 and not majorMutationUsed and rand(100) < int(min(45.0, 14.0 * s)):
+     if g.len >= 2:
+-      for i in pickMutationTargets(g, countCap):
++      let swapCap = max(1, remainingBudget div 2)
++      let targets = pickMutationTargets(g, min(swapCap, remainingBudget))
++      remainingBudget = max(0, remainingBudget - min(remainingBudget, 2 * targets.len))
++      for i in targets:
+         let offset = 1 + rand(g.len - 2)
+         let j = (i + offset) mod g.len
+         swap(g[i], g[j])
+     majorMutationUsed = true
+ 
+   # a <-> b: preserve its low activation probability; sample affected rows.
+-  if not majorMutationUsed and rand(100) < int(min(28.0, 6.0 * s)):
+-    for i in pickMutationTargets(g, countCap):
++  if remainingBudget > 0 and not majorMutationUsed and rand(100) < int(min(28.0, 6.0 * s)):
++    for i in pickMutationTargetsBudget(g, remainingBudget):
+       swap(g[i].a, g[i].b)
+       sanitizePatternWildcards(g[i])
+       ## a/bは親とseq共有され得る。sanitizeが必要な場合だけbをCOW。
+@@ -3520,8 +3563,8 @@
+     majorMutationUsed = true
+ 
+   # Pattern/replacement mutation uses the same log-uniform target count.
+-  if not majorMutationUsed and rand(100) < int(min(60.0, 26.0 * s)):
+-    for p in pickMutationTargets(g, countCap):
++  if remainingBudget > 0 and not majorMutationUsed and rand(100) < int(min(60.0, 26.0 * s)):
++    for p in pickMutationTargetsBudget(g, remainingBudget):
+       let replacementOnly = rand(99) < 35
+       if not replacementOnly:
+         g[p].a = cloneInts(g[p].a)
+@@ -3563,9 +3606,9 @@
+     majorMutationUsed = true
+ 
+   # A+(B-C)*{0,1}: change the sampled distinct rule rows.
+-  if g.len >= 3 and rand(100) < int(min(55.0, 20.0 * s)):
++  if remainingBudget > 0 and g.len >= 3 and rand(100) < int(min(55.0, 20.0 * s)):
+     var changed = newSeq[(int, float)]()
+-    for ai in pickMutationTargets(g, countCap):
++    for ai in pickMutationTargetsBudget(g, remainingBudget):
+       var bi = rand(g.len - 1)
+       var ci = rand(g.len - 1)
+       while bi == ai:
+@@ -3592,8 +3635,8 @@
+     mutateWeightFFT(g)
+ 
+   # Ordinary weight fine-tuning: event probability and sigma unchanged.
+-  if rand(100) < int(min(60.0, 25.0 * s)):
+-    for p in pickMutationTargets(g, countCap):
++  if remainingBudget > 0 and rand(100) < int(min(60.0, 25.0 * s)):
++    for p in pickMutationTargetsBudget(g, remainingBudget):
+       let oldWeight = g[p].weight
+       g[p].weight = signPreservingWeight(
+         oldWeight, oldWeight + gaussianDelta(0.05 * s)
+@@ -3601,17 +3644,27 @@
+ 
+   # Building-block relocation/duplication remains an infrequent macro step.
+   # Full-length reversal remains reachable in the unrestricted exploration lane.
+-  if not majorMutationUsed and g.len >= 16 and rand(1000) < 45:
+-    let blockLen = sampleLogUniformMutationRange(1, countCap)
++  if remainingBudget > 0 and not majorMutationUsed and g.len >= 16 and rand(1000) < 45:
++    let blockLen = sampleLogUniformMutationRange(1, max(1, remainingBudget))
+     if blockLen == g.len:
+       # A full-genome block has no alternative insertion position; reversing
+       # the whole block keeps the sampled N-rule mutation meaningful.
+       g.reverse()
+     else:
+       let src = rand(g.len - blockLen)
+-      var dst = rand(g.len - blockLen)
+-      if dst == src:
+-        dst = (src + 1 + rand(g.len - blockLen - 1)) mod (g.len - blockLen + 1)
++      var dst: int
++      if macroLane:
++        dst = rand(g.len - blockLen)
++      else:
++        # Local refinement must not move one rule across the entire genome:
++        # relocation changes every intervening rule position. Keep the move
++        # radius within the same semantic budget as the transferred block.
++        let radius = min(g.len - blockLen, max(1, countCap))
++        let lo = max(0, src - radius)
++        let hi = min(g.len - blockLen, src + radius)
++        dst = lo + rand(max(0, hi - lo))
++      if dst == src and g.len - blockLen > 0:
++        dst = if src < g.len - blockLen: src + 1 else: src - 1
+ 
+       if rand(1) == 0:
+         # block relocation: 全ruleを保ったまま区間を移動する。
+@@ -3625,11 +3678,12 @@
+           copied[j] = cloneRuleShallow(g[src + j])
+         for j in 0 ..< blockLen:
+           g[dst + j] = copied[j]
++    remainingBudget = max(0, remainingBudget - min(remainingBudget, blockLen))
+     majorMutationUsed = true
+ 
+   # Independent fine-tuning insurance: unchanged activation probability.
+-  if rand(1000) < int(min(220.0, 120.0 + 140.0 * (s - 1.0))):
+-    for p in pickMutationTargets(g, countCap):
++  if remainingBudget > 0 and rand(1000) < int(min(220.0, 120.0 + 140.0 * (s - 1.0))):
++    for p in pickMutationTargetsBudget(g, remainingBudget):
+       let oldWeight = g[p].weight
+       g[p].weight = signPreservingWeight(
+         oldWeight, oldWeight + gaussianDelta(0.035 * s)
+@@ -3639,8 +3693,8 @@
+   # evolvable without letting local/magnitude optimization flip it by accident.
+   # Guided selection preferentially targets currently harmful rules.
+   let signFlipPermille = int(min(18.0, 4.0 + 8.0 * (s - 1.0)))
+-  if rand(999) < signFlipPermille:
+-    for p in pickMutationTargets(g, countCap):
++  if remainingBudget > 0 and rand(999) < signFlipPermille:
++    for p in pickMutationTargetsBudget(g, remainingBudget):
+       if abs(g[p].weight) >= WEIGHT_SIGN_FLOOR:
+         g[p].weight = clampWeight(-g[p].weight)
+ 
+@@ -3650,7 +3704,12 @@
+   g[0].embedding = inheritedEmbedding
+   for i in 1 ..< g.len:
+     g[i].embedding = @[]
+-  mutateEmbedding(g, s, countCap)
++  # Embedding changes can recode hundreds of rules and are therefore a true
++  # macro allele. Never let the exploitation lane smuggle such a global change
++  # through a nominal 8..48-rule local budget. Cross-map rule transplant already
++  # makes ordinary crossover safe without changing the child's dictionary.
++  if macroLane:
++    mutateEmbedding(g, s, min(EMBEDDING_ENTRY_COUNT, countCap))
+ 
+   # ここで全ルールを再sanitizeするのは非常に重い。
+   # a/bを直接変える各mutation pathでは、そのruleだけ既にsanitize済み。
+@@ -4674,11 +4733,12 @@
+ proc buildFastEvalDataset(
+   srcX: seq[seq[seq[int]]],
+   srcY: seq[seq[int]],
+-  stride: int = 2
++  stride: int = 2,
++  phase: int = 0
+ ): tuple[x: seq[seq[seq[int]]], y: seq[seq[int]]] =
+-  ## 予備評価用の薄いデータセット。
+-  ## 8点の元系列からstride=4なら3点（先頭・中点・末尾）程度が残る。
+-  ## 2点Spearmanにならないことを重視し、「粗いランキング → 上位だけ完全評価」に使う。
++  ## 予備評価用の薄いデータセット。FULLの意味論はそのままに観測点だけ
++  ## 間引く。interior phaseを世代ごとに回して、同じ8点だけを何千世代も
++  ## 見続けるFAST-subset overfittingを防ぐ。先頭/末尾は常に残す。
+   result.x = newSeq[seq[seq[int]]](0)
+   result.y = newSeq[seq[int]](0)
+   let step = max(1, stride)
+@@ -4690,7 +4750,8 @@
+     var cy: seq[int] = @[]
+     cx.add(srcX[c][0])
+     cy.add(srcY[c][0])
+-    var i = step
++    let interiorPhase = ((phase mod step) + step) mod step
++    var i = 1 + interiorPhase
+     while i < n - 1:
+       cx.add(srcX[c][i])
+       cy.add(srcY[c][i])
+@@ -5320,10 +5381,22 @@
+ # Local refinement must remain genuinely local once a 1500-rule genome is
+ # already good. Counts are still log-uniform; only the valid upper bound differs
+ # by lane. Exploration keeps the full 1..N range.
+-const LOCAL_MUTATION_MAX_RULES = 32
+-const CROSSOVER_MUTATION_PERCENT = 60
++const LOCAL_MUTATION_MIN_RULES = 12
++const LOCAL_MUTATION_MAX_RULES = 48
++const EXPLORATION_LANE_BASE_PERCENT = 5
++const EXPLORATION_LANE_STAGNATION_BONUS = 15
++const ASEXUAL_BASE_PERCENT = 55
++const ASEXUAL_STAGNATION_REDUCTION = 20
++const CROSSOVER_MUTATION_PERCENT = 55
+ const CROSSOVER_TRACE_SAMPLE_COUNT = 12
+ 
++proc localMutationCap(stagnation: int): int {.inline.} =
++  ## Smoothly widen only the local lane as a plateau persists. Even at maximum
++  ## pressure it stays far below the 1500-rule macro lane.
++  let pressure = min(1.0, sqrt(float(max(0, stagnation))) / 6.0)
++  int(round(float(LOCAL_MUTATION_MIN_RULES) +
++    pressure * float(LOCAL_MUTATION_MAX_RULES - LOCAL_MUTATION_MIN_RULES)))
++
+ # パターンキャッシュを定期的にクリアする間隔。
+ # 無制限に貯め続けるとユニークな .a 列の総数に比例してメモリが
+ # 増え続けるため、ある程度で捨てて作り直す。世代内の再利用効果は
+@@ -7934,7 +8007,7 @@
+         let (l, r) = sampleCrossoverSegment(n)
+         result = twoPointGenomeCrossoverReference(p1, p2, l, r)
+       else:
+-        let count = sampleCrossoverLength(matched.len)
++        let count = sampleCrossoverLength(matched.len, LOCAL_CROSSOVER_MAX_RULES)
+         let start = rand(matched.len - count)
+         for mi in start ..< start + count:
+           let a = matched[mi].base
+@@ -7953,7 +8026,7 @@
+         if t2[i].hits > 0: active.add(i)
+       # Prefer a champion-derived contiguous functional module when the same
+       # a/b signature is present in this donor at its recorded source site.
+-      # Otherwise use a trace-active source and full-range log-uniform length.
++      # Otherwise use a trace-active source and locally bounded log-uniform length.
+       var guidedSources: seq[int] = @[]
+       if guidedModules.len > 0 and guidedReferenceGenome.len > 0 and
+           p1[0].embedding == p2[0].embedding and
+@@ -7968,7 +8041,7 @@
+               valid = false
+               break
+           if valid: guidedSources.add(mi)
+-      var length = sampleCrossoverLength(n)
++      var length = sampleCrossoverLength(n, LOCAL_CROSSOVER_MAX_RULES)
+       var src = rand(n - length)
+       if guidedSources.len > 0 and rand(99) < 40:
+         let m = guidedModules[guidedSources[rand(guidedSources.len - 1)]]
+@@ -7996,8 +8069,8 @@
+         if compatibleRule(p2[src + j]):
+           result[bestDst + j] = transplantRule(p2[src + j], p2[0].embedding, p1[0].embedding)
+     of coMacro:
+-      # Non-homologous, full-range exploration: a single log-uniform block.
+-      let length = sampleCrossoverLength(n)
++      # Explicit full-range macro operator, mirroring production.
++      let length = sampleCrossoverLength(n, n)
+       let src = rand(n - length)
+       let dst = if rand(99) < 85: src else: rand(n - length)
+       let reversed = rand(99) < 2
+@@ -10052,7 +10125,7 @@
+     maReset()
+     bestEver = -Inf
+     stagnation = 0
+-    echo "[migration] v28 stabilized 6x20 objective: old scores/archive/Jev Hall discarded; genomes retained"
++    echo "[migration] stabilized 6x20 objective: old scores/archive/Jev Hall discarded; genomes retained"
+   if loadedCheckpointVersion < 16:
+     # Remove stale history and old-objective archives; preserve population.
+     # Archival genomes were selected by incompatible branch scores.
+@@ -10115,8 +10188,13 @@
+   maReset()
+   for hi in max(0, progressHistory.len - MA_WINDOW) ..< progressHistory.len:
+     maPush(spearmanToSigma(progressHistory[hi].best))
++  # bestEver spans historical rolling datasets and is therefore not a valid
++  # absolute baseline after resume. Stagnation, however, is an intentionally
++  # slow control state and IS serialized in the checkpoint; throwing it away on
++  # every restart silently collapses the adaptive exploration regime back to
++  # generation-zero settings. Keep it unless an objective migration above
++  # explicitly reset it. slowEpochBest is re-anchored on the first resumed FULL.
+   bestEver = -Inf
+-  stagnation = 0
+ 
+   let fast = buildFastEvalDataset(evalAggsX, evalAggsY, adaptiveFastEvalStride)
+   fastAggsX = fast.x
+@@ -10370,11 +10448,9 @@
+       stagnation = (stagnation * 3) div 4
+ 
+   if datasetChanged:
+-    let fast = buildFastEvalDataset(evalAggsX, evalAggsY, adaptiveFastEvalStride)
+-    fastAggsX = fast.x
+-    fastAggsY = fast.y
++    # FULL targets changed; rebuild them now. FAST is rebuilt immediately below
++    # with this generation's rotating phase, avoiding duplicate work here.
+     evalRankedY = buildRankedY(evalAggsY)
+-    fastRankedY = buildRankedY(fastAggsY)
+     var totalSamples = 0
+     for c in evalAggsX:
+       totalSamples += c.len
+@@ -10382,6 +10458,16 @@
+          " medium=", refreshedMedium, " slow=", refreshedSlow, " total_cases=", evalAggsX.len,
+          " total_samples=", totalSamples
+ 
++  # Rotate the FAST interior sample phase every generation even when the FULL
++  # rolling dataset did not change. This is cheap (only seq references are
++  # rebuilt) and prevents selection from adapting to a permanently fixed subset.
++  let fastPhase = iter mod max(1, adaptiveFastEvalStride)
++  let phasedFast = buildFastEvalDataset(evalAggsX, evalAggsY,
++    adaptiveFastEvalStride, fastPhase)
++  fastAggsX = phasedFast.x
++  fastAggsY = phasedFast.y
++  fastRankedY = buildRankedY(fastAggsY)
++
+   if iter > 0 and iter mod CACHE_CLEAR_INTERVAL == 0:
+     # 100世代ごとの全消去は再コンパイルを大量発生させ、
+     # キャッシュの恩恵を捨ててしまう。まずは長い間隔だけで世代を切る。
+@@ -10925,7 +11011,7 @@
+     adaptiveFastEvalStride = min(FAST_EVAL_STRIDE_MAX, adaptiveFastEvalStride + 1)
+ 
+   if adaptiveFastEvalStride != previousFastStride:
+-    let nextFast = buildFastEvalDataset(evalAggsX, evalAggsY, adaptiveFastEvalStride)
++    let nextFast = buildFastEvalDataset(evalAggsX, evalAggsY, adaptiveFastEvalStride, fastPhase)
+     fastAggsX = nextFast.x
+     fastAggsY = nextFast.y
+     fastRankedY = buildRankedY(fastAggsY)
+@@ -11623,10 +11709,19 @@
+   let adaptiveImmigrantRate = min(0.12,
+     IMMIGRANT_RATE + STAGNATION_IMMIGRANT_BONUS * stagnationPressure +
+     0.02 * diversityPressure)
++  let localMutationCapGen = localMutationCap(stagnation)
++  let asexualPercentGen = max(25, int(round(float(ASEXUAL_BASE_PERCENT) -
++    float(ASEXUAL_STAGNATION_REDUCTION) * stagnationPressure)))
++  let explorationPercentGen = min(25, int(round(float(EXPLORATION_LANE_BASE_PERCENT) +
++    float(EXPLORATION_LANE_STAGNATION_BONUS) * stagnationPressure)))
+ 
+   echo "  diversity_pair_rate=", formatFloat(diversePairRate, ffDecimal, 3),
+        " parent_random=", formatFloat(parentRandomRate, ffDecimal, 3),
+        " immigrant=", formatFloat(adaptiveImmigrantRate, ffDecimal, 3)
++  echo "  variation: local_cap=", localMutationCapGen,
++       " asexual%=", asexualPercentGen,
++       " macro_mutation%=", explorationPercentGen,
++       " crossover_macro%=", CROSSOVER_MACRO_PERCENT
+ 
+   # この世代の先頭で次世代へそのまま継ぐ個体数を正確に覚える。
+   # archiveが8件埋まらなかった場合に、ただの子個体まで次世代FULL保護しない。
+@@ -11667,7 +11762,7 @@
+     if survivorIds.len == 0: break
+     let parent = rand(min(coreEliteCount, survivorIds.len) - 1)
+     var probeChild = cloneGenome(new_population[parent])
+-    mutateGenome(probeChild, feedbackMutationScale, 0, LOCAL_MUTATION_MAX_RULES)
++    mutateGenome(probeChild, feedbackMutationScale, 0, localMutationCap(stagnation))
+     mutationProbes.add((parent: parent, child: new_population.len))
+     new_population.add(probeChild)
+ 
+@@ -11789,7 +11884,7 @@
+     # 同時に組み替えてしまうため、局所探索laneを少し太くする。
+     var child: Genome
+     var didCrossover = false
+-    if rand(99) < 40:
++    if rand(99) < asexualPercentGen:
+       releaseParentUse(parentUseCount, p2i) # asexual child used only p1
+       child = cloneGenome(p1)
+     else:
+@@ -11801,7 +11896,11 @@
+       let t2 = if needsTrace: parentTrace(p2i) else: newSeq[RuleTraceRow](0)
+       let started = epochTime()
+       child = crossoverGenome(p1, p2, op, t1, t2)
+-      crossoverEmbedding(child, p2)
++      # Do not independently splice the embedding after rule crossover. Donor
++      # rules were already recoded into p1's coordinate system by transplant;
++      # a second dictionary crossover would create a third coordinate system and
++      # disable trace-guided homology on the next mating. Embeddings still evolve
++      # in the explicit macro mutation lane.
+       inc crossoverLastCounts[op]
+       crossoverLastSeconds[op] += epochTime() - started
+ 
+@@ -11813,11 +11912,11 @@
+     # a minority exploration lane keeps the original full 1..N distribution.
+     let shouldMutate = (not didCrossover) or rand(99) < CROSSOVER_MUTATION_PERCENT
+     if shouldMutate:
+-      let explorationLane = rand(99) < 20
++      let explorationLane = rand(99) < explorationPercentGen
+       let mutationScale = if explorationLane:
+                             min(1.7, 1.0 + 0.55 * stagnationPressure)
+                           else: feedbackMutationScale
+-      let mutationCap = if explorationLane: child.len else: LOCAL_MUTATION_MAX_RULES
++      let mutationCap = if explorationLane: child.len else: localMutationCapGen
+       mutateGenome(child, mutationScale,
+         if explorationLane: stagnation else: 0, mutationCap)
+     let childFingerprint = rescueDuplicateOffspring(child, new_population,

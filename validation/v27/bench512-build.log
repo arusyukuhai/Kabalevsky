@@ -1,0 +1,83 @@
+Hint: used config file '/tmp/nim-2.2.4/config/nim.cfg' [Conf]
+Hint: used config file '/tmp/nim-2.2.4/config/config.nims' [Conf]
+.....................................................................................................................................
+/tmp/bench512.nim(35, 11) Warning: use the nimble packages `malebolgia`, `taskpools` or `weave` instead; threadpool is deprecated [Deprecated]
+.......
+/tmp/bench512.nim(1965, 9) Hint: 'OP_COUNT' is declared but not used [XDeclaredButNotUsed]
+/tmp/bench512.nim(2378, 7) Warning: use `delete(s, first..last)`; delete is deprecated [Deprecated]
+/tmp/bench512.nim(2386, 7) Warning: use `delete(s, first..last)`; delete is deprecated [Deprecated]
+/tmp/bench512.nim(2399, 9) Warning: use `delete(s, first..last)`; delete is deprecated [Deprecated]
+......
+/tmp/bench512.nim(2230, 6) Hint: 'at' is declared but not used [XDeclaredButNotUsed]
+/tmp/bench512.nim(2249, 6) Hint: 'makeRandomPatternSegment' is declared but not used [XDeclaredButNotUsed]
+/tmp/bench512.nim(2503, 7) Hint: 'JEV_HALL_COMPARE_SLOTS' is declared but not used [XDeclaredButNotUsed]
+/tmp/bench512.nim(2506, 7) Hint: 'JEV_DONOR_POOL_CAP' is declared but not used [XDeclaredButNotUsed]
+/tmp/bench512.nim(2507, 7) Hint: 'JEV_DONOR_MIN_DISTANCE' is declared but not used [XDeclaredButNotUsed]
+/tmp/bench512.nim(2512, 7) Hint: 'JEV_DONOR_RATE' is declared but not used [XDeclaredButNotUsed]
+/tmp/bench512.nim(2513, 7) Hint: 'JEV_FRESH_DONOR_RATE' is declared but not used [XDeclaredButNotUsed]
+/tmp/bench512.nim(2600, 6) Hint: 'weightScore' is declared but not used [XDeclaredButNotUsed]
+/tmp/bench512.nim(2603, 6) Hint: 'weightScoreDerivative' is declared but not used [XDeclaredButNotUsed]
+/tmp/bench512.nim(2606, 6) Hint: 'randomCutPoints' is declared but not used [XDeclaredButNotUsed]
+/tmp/bench512.nim(3031, 6) Hint: 'swapRandomRows' is declared but not used [XDeclaredButNotUsed]
+/tmp/bench512.nim(3044, 6) Hint: 'swapABRows' is declared but not used [XDeclaredButNotUsed]
+/tmp/bench512.nim(3120, 7) Hint: 'MAX_REASONABLE_WEIGHT' is declared but not used [XDeclaredButNotUsed]
+/tmp/bench512.nim(3194, 6) Hint: 'mutateWeightAffine' is declared but not used [XDeclaredButNotUsed]
+/tmp/bench512.nim(4929, 6) Hint: 'parallelEvaluateIndividualBatch' is declared but not used [XDeclaredButNotUsed]
+/tmp/bench512.nim(5040, 6) Hint: 'erfinv' is declared but not used [XDeclaredButNotUsed]
+/tmp/bench512.nim(5307, 7) Hint: 'POLL_INTERVAL_MS' is declared but not used [XDeclaredButNotUsed]
+/tmp/bench512.nim(5308, 7) Hint: 'STUCK_LOG_EVERY_N_POLLS' is declared but not used [XDeclaredButNotUsed]
+/tmp/bench512.nim(5416, 6) Hint: 'jevHallInjectionOrder' is declared but not used [XDeclaredButNotUsed]
+/tmp/bench512.nim(5647, 6) Hint: 'bestArchiveEntry' is declared but not used [XDeclaredButNotUsed]
+/tmp/bench512.nim(6485, 6) Hint: 'rollingAgeAtResume' is declared but not used [XDeclaredButNotUsed]
+/tmp/bench512.nim(7356, 7) Hint: 'JEV_SURVIVOR_SLOTS' is declared but not used [XDeclaredButNotUsed]
+CC: nim-2.2.4/lib/system/exceptions.nim
+CC: nim-2.2.4/lib/std/sysatomics.nim
+CC: nim-2.2.4/lib/std/private/digitsutils.nim
+CC: nim-2.2.4/lib/std/assertions.nim
+CC: nim-2.2.4/lib/system/iterators.nim
+CC: nim-2.2.4/lib/std/private/dragonbox.nim
+CC: nim-2.2.4/lib/std/formatfloat.nim
+CC: nim-2.2.4/lib/system/dollars.nim
+CC: nim-2.2.4/lib/std/typedthreads.nim
+CC: nim-2.2.4/lib/std/syncio.nim
+CC: nim-2.2.4/lib/system.nim
+CC: nim-2.2.4/lib/pure/collections/sequtils.nim
+CC: nim-2.2.4/lib/pure/algorithm.nim
+CC: nim-2.2.4/lib/pure/math.nim
+CC: nim-2.2.4/lib/pure/hashes.nim
+CC: nim-2.2.4/lib/pure/parseutils.nim
+CC: nim-2.2.4/lib/pure/unicode.nim
+CC: nim-2.2.4/lib/pure/strutils.nim
+CC: nim-2.2.4/lib/pure/pathnorm.nim
+CC: nim-2.2.4/lib/std/oserrors.nim
+CC: nim-2.2.4/lib/posix/posix.nim
+CC: nim-2.2.4/lib/std/private/oscommon.nim
+CC: nim-2.2.4/lib/std/private/ospaths2.nim
+CC: nim-2.2.4/lib/std/private/ossymlinks.nim
+CC: nim-2.2.4/lib/pure/times.nim
+CC: nim-2.2.4/lib/std/private/osfiles.nim
+CC: nim-2.2.4/lib/std/envvars.nim
+CC: nim-2.2.4/lib/std/private/osappdirs.nim
+CC: nim-2.2.4/lib/std/cmdline.nim
+CC: nim-2.2.4/lib/pure/os.nim
+CC: nim-2.2.4/lib/std/sysrand.nim
+CC: nim-2.2.4/lib/std/monotimes.nim
+CC: nim-2.2.4/lib/pure/random.nim
+CC: nim-2.2.4/lib/pure/strformat.nim
+CC: nim-2.2.4/lib/pure/complex.nim
+CC: nim-2.2.4/lib/pure/collections/tables.nim
+CC: nim-2.2.4/lib/pure/streams.nim
+CC: ../workspace/scratch/95ee4930f983/test_support/progress.nim
+CC: nim-2.2.4/lib/pure/concurrency/cpuinfo.nim
+CC: nim-2.2.4/lib/pure/concurrency/cpuload.nim
+CC: nim-2.2.4/lib/pure/concurrency/threadpool.nim
+CC: nim-2.2.4/lib/pure/collections/sets.nim
+CC: nim-2.2.4/lib/pure/lexbase.nim
+CC: nim-2.2.4/lib/pure/parsejson.nim
+CC: nim-2.2.4/lib/pure/json.nim
+CC: nim-2.2.4/lib/pure/strtabs.nim
+CC: nim-2.2.4/lib/pure/osproc.nim
+CC: bench512.nim
+Hint:  [Link]
+Hint: mm: orc; threads: on; opt: speed; options: -d:release
+81883 lines; 33.788s; 218.75MiB peakmem; proj: /tmp/bench512.nim; out: /tmp/bench512 [SuccessX]

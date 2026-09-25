@@ -1,0 +1,14 @@
+........Jev API: scoring 64 candidates with 1 workers
+Jev API: score stage took 0.00s; KwikSort short list=64
+Jev API: finished; score_s=0.00 pair_s=0.00 comparisons=64
+..Jev API: scoring 2 candidates with 1 workers
+Jev API: score stage took 0.00s; KwikSort short list=2
+Jev API: finished; score_s=0.00 pair_s=0.00 comparisons=1
+..Jev API: scoring 2 candidates with 1 workers
+Jev API: score stage took 0.00s; KwikSort short list=2
+Jev API: finished; score_s=0.00 pair_s=0.00 comparisons=1
+........................................
+----------------------------------------------------------------------
+Ran 52 tests in 0.108s
+
+OK

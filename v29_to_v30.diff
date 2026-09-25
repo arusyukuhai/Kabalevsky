@@ -1,0 +1,374 @@
+--- /mnt/data/at_jev_v29_refined.nim	2026-09-25 07:57:08.885198363 +0000
++++ at_jev.nim	2026-09-25 08:05:25.016360647 +0000
+@@ -23,6 +23,9 @@
+ #      rotate FAST observations, enforce a shared local mutation budget, keep
+ #      embedding edits out of exploitation, and separate local from macro
+ #      crossover/exploration pressure.
++# v30: unbiased equal-case objective, exact 6x20 hard-negative replacement,
++#      slow-only stagnation epochs, matched crossover experiments, and exact
++#      rolling scheduler state across checkpoint resume.
+ # Audit: bounded parent pools, exact-duplicate rescue, cached distance minima.
+ # Build: nim c -d:release --threads:on at.nim
+ # Verify: ./at --regression-test && ./at --self-test
+@@ -3031,11 +3034,23 @@
+   result[0].embedding = p1[0].embedding
+   for i in 1 ..< result.len: result[i].embedding = @[]
+ 
+-proc chooseCrossoverOp(preference: array[CrossoverOp, float]): CrossoverOp =
+-  ## Every operator is probed with an exact paired FULL evaluation each
+-  ## generation, so reproduction itself does not need a 40% blind exploration
+-  ## tax. Keep a 20% floor and let the remaining 80% follow measured utility.
+-  ## Runtime-only preferences reset on resume: no checkpoint format change.
++proc chooseCrossoverOp(
++  preference: array[CrossoverOp, float],
++  allowTraceOperators: bool = true
++): CrossoverOp =
++  ## Every operator is probed with matched, exact FULL evaluation.  When parent
++  ## embeddings differ, homologous/module trace hashes live in different token
++  ## coordinate systems; do not select those operators only to have
++  ## crossoverGenome silently execute a two-point fallback and mis-credit the
++  ## wrong operator.
++  if not allowTraceOperators:
++    if rand(1.0) < 0.20:
++      return (if rand(1) == 0: coTwoPoint else: coMacro)
++    let wTwo = exp(max(-4.0, min(4.0, 10.0 * preference[coTwoPoint])))
++    let wMacro = exp(max(-4.0, min(4.0, 10.0 * preference[coMacro])))
++    if rand(wTwo + wMacro) <= wTwo: return coTwoPoint
++    return coMacro
++
+   if rand(1.0) < 0.20:
+     return CrossoverOp(rand(CROSSOVER_OP_COUNT - 1))
+   var weights: array[CrossoverOp, float]
+@@ -3050,6 +3065,7 @@
+     if draw <= cumulative: return op
+   coTwoPoint
+ 
++
+ # Number of RULES touched by one triggered mutation operator.
+ # x = exp(U[0, ln(N)]), rounded to the nearest integer in [1, N].
+ # The triggering probability of each mutation operator is unchanged.
+@@ -4040,14 +4056,21 @@
+ ) =
+   ## Bounded hard examples, generated only when a rolling case refreshes.
+   ## Targets remain corruption distance, NOT assumed human quality labels.
+-  ## fast/medium/slowでadversarial mining強度を変え、2世代caseの急な
+-  ## teacher-driven distribution shiftが選択を振り回さないようにする。
++  ##
++  ## IMPORTANT: hard-negative mining must not silently change the statistical
++  ## resolution of Spearman from case to case.  The base trajectory is exactly
++  ## RETAINED_SAMPLES_PER_CASE points; mined examples REPLACE the nearest-rank
++  ## interior observation instead of being appended.  Thus 6x20 really means
++  ## 120 training observations and every per-case Spearman uses exactly 20.
+   let stages = max(0, min(4, maxStages))
+-  if stages == 0 or miningGenome.len == 0 or base.len < 2:
++  if stages == 0 or miningGenome.len == 0 or base.len < 2 or xs.len < 3 or
++     ys.len != xs.len:
+     return
+   var scratch = newEvalScratch(miningGenome.len)
+   prepareScoreScratch(miningGenome, scratch)
+   var state = cloneInts(base)
++  var used = newSeq[bool](xs.len)
++  used[0] = true  # never replace the clean anchor
+   for stage in 0 ..< stages:
+     var chosen: seq[int] = @[]
+     var best = -Inf
+@@ -4070,9 +4093,25 @@
+         discard
+     if chosen.len > 0:
+       state = chosen
+-      let damage = max(1, clampDiffScore(estimateDiffusionDamage(base, state, 0), base.len - 1))
+-      xs.add(cloneInts(state))
+-      ys.add(max(1, base.len - damage))
++      let damage = max(1, clampDiffScore(
++        estimateDiffusionDamage(base, state, 0), base.len - 1))
++      let target = max(1, base.len - damage)
++
++      # Replace the trajectory observation with the closest target rank so the
++      # global difficulty coverage is disturbed as little as possible.  Avoid
++      # replacing one slot twice when multiple mining stages are enabled.
++      var replaceAt = -1
++      var bestGap = high(int)
++      for i in 1 ..< xs.len:
++        if used[i]: continue
++        let gap = abs(ys[i] - target)
++        if gap < bestGap:
++          bestGap = gap
++          replaceAt = i
++      if replaceAt >= 1:
++        xs[replaceAt] = cloneInts(state)
++        ys[replaceAt] = target
++        used[replaceAt] = true
+ 
+ 
+ proc evaluateIndividualCases(
+@@ -4202,19 +4241,14 @@
+ var progressSigmaOffset: array[MULTI_CASE_COUNT, float]
+ 
+ proc rollingCaseBaseWeight(caseId, caseCount: int): float {.inline.} =
+-  ## slotそのものの長期的な重要度。これはdataset refresh直後でも変えない。
+-  ## 以前は refresh 直後に「slotの重みそのもの」を25%へ落としていたため、
+-  ## 新caseの影響を弱める代わりに残り2caseの相対重みが急上昇し、
+-  ## aggregate fitnessの分母まで毎世代動くという別のobjective shockを作っていた。
+-  if caseCount < 3:
+-    return 1.0
+-  # More stable (less frequently refreshed) cases receive more long-term
+-  # aggregate weight.  Per-case lifetimes are FAST/MEDIUM/SLOW = 8/16/32.
+-  case caseId mod 3
+-  of FAST_ROLLING_SLOT: result = 1.0
+-  of MEDIUM_ROLLING_SLOT: result = 2.0
+-  of SLOW_ROLLING_SLOT: result = 3.0
+-  else: result = 1.0
++  ## Every active trajectory is sampled from the same corpus distribution and
++  ## therefore represents the same statistical objective.  Refresh lifetime is
++  ## a variance-control device, NOT an importance label.  Weighting the slow
++  ## slots 3x made them dominate twice: they persisted longer *and* counted more
++  ## each generation.  Keep the reported/accepted objective unbiased and equal.
++  discard caseId
++  discard caseCount
++  1.0
+ 
+ proc rollingCaseMaturity(caseId, caseCount: int): float {.inline.} =
+   ## Parent-selection heuristic only: soften lexicase filtering on fresh cases.
+@@ -4234,10 +4268,10 @@
+   min(1.0, 0.25 + 0.75 * float(max(0, age)) / float(max(1, rampGenerations)))
+ 
+ proc rollingCaseSelectionWeight(caseId, caseCount: int): float {.inline.} =
+-  ## Lexicaseの先頭case抽選だけは新caseを控えめにする。
+-  ## aggregate側とは違い、ここは順序確率なので maturity を掛けても
+-  ## objectiveの分母は動かない。
+-  rollingCaseBaseWeight(caseId, caseCount) * rollingCaseMaturity(caseId, caseCount)
++  ## Lexicase order may softly discount a freshly refreshed case while its
++  ## population response is still noisy.  Once mature, every case is equally
++  ## likely to appear early; lifetime never becomes an importance multiplier.
++  rollingCaseMaturity(caseId, caseCount)
+ 
+ proc aggregateCaseScores(x: openArray[float]): float {.inline.} =
+   ## A score must not change solely because a rolling case became older.
+@@ -5825,8 +5859,8 @@
+     fixedMovingAvg: float
+ 
+ const CHECKPOINT_MAGIC = "KLEISMIC_GA_CHECKPOINT"
+-const CHECKPOINT_VERSION = 28
+-const CHECKPOINT_OBJECTIVE_VERSION = 28 # stabilized 6x20 rolling objective
++const CHECKPOINT_VERSION = 30
++const CHECKPOINT_OBJECTIVE_VERSION = 30 # v30: unbiased equal-case 6x20 objective
+ var migratedRuleCount = false
+ var loadedCheckpointVersion = 0
+ const CHECKPOINT_INTERVAL = 50
+@@ -6312,6 +6346,13 @@
+   fs.write(runSeed)
+   for ci in 0 ..< MULTI_CASE_COUNT:
+     fs.write(progressSigmaOffset[ci])
++  # v30: rolling-case age and scheduler credit are part of the objective state.
++  # Reconstructing them from generation number loses which of the two slots in
++  # each timescale was refreshed most recently and changes post-resume dynamics.
++  for ci in 0 ..< MULTI_CASE_COUNT:
++    fs.write(rollingCaseAge[ci].int64)
++  for group in 0 .. 2:
++    fs.write(rollingRefreshCredit[group].int64)
+ 
+   let savedMa = maValuesChronological()
+   fs.write(savedMa.len.int64)
+@@ -6395,7 +6436,7 @@
+       raise newException(IOError, "Invalid checkpoint magic: " & path)
+ 
+     let version = int(fs.readInt64())
+-    if version < 3 or (version > 9 and version notin [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, CHECKPOINT_VERSION]):
++    if version < 3 or (version > 9 and version notin [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, CHECKPOINT_VERSION]):
+       raise newException(IOError, "Unsupported checkpoint version: " & $version)
+ 
+     nextIter = int(fs.readInt64())
+@@ -6431,6 +6472,12 @@
+         if ci < MULTI_CASE_COUNT:
+           progressSigmaOffset[ci] = storedOffset
+ 
++    if version >= 30:
++      for ci in 0 ..< MULTI_CASE_COUNT:
++        rollingCaseAge[ci] = max(0, int(fs.readInt64()))
++      for group in 0 .. 2:
++        rollingRefreshCredit[group] = max(0, int(fs.readInt64()))
++
+     let maLen64 = fs.readInt64()
+     if maLen64 < 0 or maLen64 > 10_000_000:
+       raise newException(IOError, "Invalid moving-average history length.")
+@@ -10030,13 +10077,13 @@
+   doAssert abs(aggregateCaseScores(scores) - 1.0) < 1.0e-12
+   for ci in 0 ..< MULTI_CASE_COUNT:
+     scores[ci] = 0.0
+-    let expectedDrop = float(1 + ci mod 3) / float(6 * CASES_PER_TIMESCALE)
++    let expectedDrop = 1.0 / float(MULTI_CASE_COUNT)
+     doAssert abs(1.0 - aggregateCaseScores(scores) - expectedDrop) < 1.0e-12
+     scores[ci] = 1.0
+   let indices = retainedTrajectoryIndices(RETAINED_SAMPLES_PER_CASE, 18)
+   doAssert indices.len == 18 and indices[0] == 0 and indices[^1] == RETAINED_SAMPLES_PER_CASE-1
+   for i in 1 ..< indices.len: doAssert indices[i] > indices[i - 1]
+-  echo "PASS: configured case weights and full-range trajectory sampling"
++  echo "PASS: equal rolling-case objective weights and full-range trajectory sampling"
+   doAssert AAA == 1500
+   let syntheticScores = @[0.800, 0.798, 0.700, 0.795]
+   let syntheticTimes = @[10.0, 1.0, 0.5, 5.0]
+@@ -10115,8 +10162,10 @@
+     progressHistory.setLen(0)
+     echo "[migration] legacy rule count expanded (population/archive); plot history restarted"
+   if loadedCheckpointVersion < CHECKPOINT_OBJECTIVE_VERSION:
+-    # Arithmetic now closes in 512 rather than 256 tokens. Even when byte
+-    # coordinates are unchanged, previous scores and Jev trust are not comparable.
++    # v30 changes the actual selection objective: all six cases are equally
++    # weighted and hard negatives replace (rather than append to) trajectory
++    # observations.  Keep genomes, but never splice old 20/21-point datasets or
++    # old scores into the new exact 6x20 objective.
+     progressHistory.setLen(0)
+     eliteOfElites.setLen(0)
+     jevHall.setLen(0)
+@@ -10125,7 +10174,9 @@
+     maReset()
+     bestEver = -Inf
+     stagnation = 0
+-    echo "[migration] stabilized 6x20 objective: old scores/archive/Jev Hall discarded; genomes retained"
++    evalAggsX.setLen(0)
++    evalAggsY.setLen(0)
++    echo "[migration] v30 equal-case exact-6x20 objective: scores/archive/dataset/Jev Hall reset; genomes retained"
+   if loadedCheckpointVersion < 16:
+     # Remove stale history and old-objective archives; preserve population.
+     # Archival genomes were selected by incompatible branch scores.
+@@ -10133,12 +10184,16 @@
+     eliteOfElites.setLen(0)
+     echo "[migration] v16 single trajectory: branch alleles discarded; old score/archive history reset"
+   protectedPrefixCount = min(eliteCount + ARCHIVE_INJECT_COUNT, pop_size)
+-  for ci in 0 ..< MULTI_CASE_COUNT:
+-    case ci mod 3
+-    of FAST_ROLLING_SLOT: rollingCaseAge[ci] = startIter mod FAST_DATASET_REFRESH_INTERVAL
+-    of MEDIUM_ROLLING_SLOT: rollingCaseAge[ci] = startIter mod MEDIUM_DATASET_REFRESH_INTERVAL
+-    else: rollingCaseAge[ci] = startIter mod SLOW_DATASET_REFRESH_INTERVAL
+-  rebuildRollingRefreshCredit(startIter)
++  if loadedCheckpointVersion < 30:
++    # Legacy checkpoints did not serialize which member of each two-case
++    # timescale was refreshed most recently.  Use a conservative reconstruction
++    # only for migration; v30+ resumes the exact scheduler state byte-for-byte.
++    for ci in 0 ..< MULTI_CASE_COUNT:
++      case ci mod 3
++      of FAST_ROLLING_SLOT: rollingCaseAge[ci] = startIter mod FAST_DATASET_REFRESH_INTERVAL
++      of MEDIUM_ROLLING_SLOT: rollingCaseAge[ci] = startIter mod MEDIUM_DATASET_REFRESH_INTERVAL
++      else: rollingCaseAge[ci] = startIter mod SLOW_DATASET_REFRESH_INTERVAL
++    rebuildRollingRefreshCredit(startIter)
+   rebuildPlotMovingAverages(progressHistory)
+   if population.len != pop_size and population.len != 400:
+     quit("Checkpoint population size (" & $population.len &
+@@ -10285,7 +10340,6 @@
+ var crossoverPreference: array[CrossoverOp, float]
+ var crossoverLastCounts: array[CrossoverOp, int]
+ var crossoverLastSeconds: array[CrossoverOp, float]
+-const CROSSOVER_PROBE_COUNT = CROSSOVER_OP_COUNT
+ 
+ var mutationSuccessEma = 0.20
+ var feedbackMutationScale = 1.0
+@@ -10438,14 +10492,17 @@
+         of MEDIUM_ROLLING_SLOT: refreshedMedium = true
+         of SLOW_ROLLING_SLOT: refreshedSlow = true
+         else: discard
+-      # 新しいslow caseと古いslow caseの絶対scoreは比較しない。
+-      # case交換そのものは悪化ではないのでbaselineは張り直す。
+-      # ただし stagnation を毎32世代ゼロへ戻すと、長期停滞でも探索圧が
+-      # 永遠に育たない。半減だけして「過去の停滞証拠」を穏やかに残す。
+-      slowEpochInitialized = false
+-      slowEpochBest = -Inf
+-      # dataset境界だけで探索圧を急落させない。25%だけ減衰させて連続化する。
+-      stagnation = (stagnation * 3) div 4
++      # Stagnation is measured ONLY on the two slow cases.  v29 accidentally
++      # re-anchored this baseline on *every* fast/medium refresh (~7/16 of all
++      # generations), so stagnation almost never had time to grow and the
++      # adaptive local/macro exploration schedule was effectively disabled.
++      # Re-anchor only when the objective actually used by the stagnation meter
++      # changes: one of the slow cases was refreshed.
++      if refreshedSlow:
++        slowEpochInitialized = false
++        slowEpochBest = -Inf
++        # Preserve most accumulated plateau evidence across a half-panel swap.
++        stagnation = (stagnation * 3) div 4
+ 
+   if datasetChanged:
+     # FULL targets changed; rebuild them now. FAST is rebuilt immediately below
+@@ -11766,28 +11823,45 @@
+     mutationProbes.add((parent: parent, child: new_population.len))
+     new_population.add(probeChild)
+ 
+-  # One non-mutated matched FULL probe for EACH operator per generation.
+-  # The probe's parent is unchanged and is already FULL-protected.
+-  for probeId in 0 ..< min(CROSSOVER_PROBE_COUNT, pop_size - new_population.len):
+-    if survivorIds.len < 2 or coreEliteCount <= 0: break
+-    let op = CrossoverOp((iter * CROSSOVER_PROBE_COUNT + probeId) mod CROSSOVER_OP_COUNT)
++  # Matched crossover experiment: all eligible operators see the SAME
++  # parent/donor pair.  v29 used a different random pair for each operator, so
++  # operator EMA mixed operator quality with pair difficulty.  The unchanged
++  # parent is already FULL-protected and every probe child is compulsory FULL.
++  if survivorIds.len >= 2 and coreEliteCount > 0 and
++     new_population.len < pop_size:
+     let parent = rand(min(coreEliteCount, survivorIds.len) - 1)
+     let pId = survivorIds[parent]
+-    var donorId = survivorIds[rand(survivorIds.len - 1)]
+-    if donorId == pId:
+-      donorId = survivorIds[(parent + 1) mod survivorIds.len]
+-    let needsTrace = op in {coHomologous, coModule} and
+-      population[pId][0].embedding == population[donorId][0].embedding
+-    let t1 = if needsTrace: parentTrace(pId) else: newSeq[RuleTraceRow](0)
+-    let t2 = if needsTrace: parentTrace(donorId) else: newSeq[RuleTraceRow](0)
+-    let started = epochTime()
+-    let child = crossoverGenome(population[pId], population[donorId], op, t1, t2)
+-    let elapsed = epochTime() - started
+-    crossoverProbes.add((parent: parent, child: new_population.len,
+-      op: op, seconds: elapsed))
+-    inc crossoverLastCounts[op]
+-    crossoverLastSeconds[op] += elapsed
+-    new_population.add(child)
++    var donorId = -1
++    # Prefer a same-coordinate donor so trace-guided operators are genuinely
++    # tested rather than silently becoming two-point crossover.
++    var sameMapDonors: seq[int] = @[]
++    for sid in survivorIds:
++      if sid != pId and population[sid][0].embedding == population[pId][0].embedding:
++        sameMapDonors.add(sid)
++    if sameMapDonors.len > 0:
++      donorId = sameMapDonors[rand(sameMapDonors.len - 1)]
++    else:
++      for sid in survivorIds:
++        if sid != pId:
++          donorId = sid
++          break
++    if donorId >= 0:
++      let sameMap = population[pId][0].embedding == population[donorId][0].embedding
++      for op in CrossoverOp:
++        if new_population.len >= pop_size: break
++        if op in {coHomologous, coModule} and not sameMap:
++          continue
++        let needsTrace = op in {coHomologous, coModule}
++        let t1 = if needsTrace: parentTrace(pId) else: newSeq[RuleTraceRow](0)
++        let t2 = if needsTrace: parentTrace(donorId) else: newSeq[RuleTraceRow](0)
++        let started = epochTime()
++        let child = crossoverGenome(population[pId], population[donorId], op, t1, t2)
++        let elapsed = epochTime() - started
++        crossoverProbes.add((parent: parent, child: new_population.len,
++          op: op, seconds: elapsed))
++        inc crossoverLastCounts[op]
++        crossoverLastSeconds[op] += elapsed
++        new_population.add(child)
+ 
+   var offspringBuckets = initTable[Hash, seq[int]]()
+   for id, genome in new_population:
+@@ -11889,9 +11963,14 @@
+       child = cloneGenome(p1)
+     else:
+       didCrossover = true
+-      let op = if fusionMating: (if rand(1) == 0: coHomologous else: coModule)
+-               else: chooseCrossoverOp(crossoverPreference)
+-      let needsTrace = op in {coHomologous, coModule} and p1[0].embedding == p2[0].embedding
++      let sameMap = p1[0].embedding == p2[0].embedding
++      let op = if fusionMating and sameMap:
++                 (if rand(1) == 0: coHomologous else: coModule)
++               elif fusionMating:
++                 chooseCrossoverOp(crossoverPreference, false)
++               else:
++                 chooseCrossoverOp(crossoverPreference, sameMap)
++      let needsTrace = op in {coHomologous, coModule}
+       let t1 = if needsTrace: parentTrace(p1i) else: newSeq[RuleTraceRow](0)
+       let t2 = if needsTrace: parentTrace(p2i) else: newSeq[RuleTraceRow](0)
+       let started = epochTime()

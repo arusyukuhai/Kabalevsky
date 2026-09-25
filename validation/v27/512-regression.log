@@ -1,0 +1,58 @@
+middle wildcard: expected=@[120, 120] actual=@[120, 120]
+leading wildcard: expected=@[122, 122, 113] actual=@[122, 122, 113]
+PASS: 1500-byte / 1500-token embedding and exact output boundary
+PASS: invalid end-of-buffer captures/copies rejected before access
+PASS: modulo-512 capture arithmetic, latent tokens and OOV safety
+PASS: single-pass similarity retains empty/equal/mismatch semantics
+PASS: later literal anchored wildcard indexing preserves candidates
+PASS: sparse candidate index covers 512 internal tokens plus OOV
+PASS: overlapping occurrence lookup without overlapping replacements
+PASS: FAST controller bounds and sentinel-free byte sampling domain
+PASS: log-uniform sparse selection exactly matches legacy Fisher-Yates
+PASS: unrestricted sampler preserved for macro mutation exploration
+PASS: unmatched wildcard, output cap and literal opcode handling
+PASS: long literal KMP retains leftmost non-overlapping semantics
+PASS: 192 wildcard/internal-anchor cases match independent full scan
+PASS: 128 random deterministic trajectories match independent reference
+PASS: reused input buffers match independent reference across 250 samples
+competing rules: expected=1 actual=1.0
+same-round chain: expected=3 actual=3.0
+PASS: ordered single-sweep override and sqrt-length temporal ceiling
+PASS: rounds, sqrt ceiling, 2-gram discard and rule credit
+PASS: overflow penalized once and terminates single trajectory sweep
+PASS: one-round weight feature cache matches exact evaluator
+PASS: rule visit 32,769 is evaluated (within normal work budget)
+PASS: 1500 ordered matches without recursive state expansion
+PASS: sparse evaluator skips misses and rescans after each ordered rewrite
+PASS: 1000 random ordered evaluations match independent reference
+credit evaluator agrees with ordered reference
+PASS: rule-sequence crossover preserves donor and outside segments
+PASS: homologous numeric weight blending without branch alleles
+PASS: whole-rule crossover rejects invalid donor references
+PASS: all mutation target counts follow the unrestricted logarithmic law
+PASS: replacement-reference sanitation and invalid-opcode rejection
+PASS: mutation never corrupts parent or capture references
+PASS: crossover operator coHomologous
+PASS: crossover operator coModule
+PASS: crossover operator coTwoPoint
+PASS: crossover operator coMacro
+PASS: ordered homology and immutable crossover parents
+PASS: genomic identity includes pattern/replacement/weight and embedding
+candidate scan 1000 x 1500 repeated bytes CPU seconds: 0.009050732000000006
+PASS: suffix-only candidate scan retains exactly the eligible rules
+Migrated population: 500 -> 450 (survivor prefix retained; trailing legacy entries dropped)
+[checkpoint] population expanded: 400 -> 450 (original genomes and their indices preserved; 50 new genomes appended for FAST evaluation)
+[checkpoint] population expanded: 400 -> 450 (original genomes and their indices preserved; 50 new genomes appended for FAST evaluation)
+[checkpoint] population expanded: 400 -> 450 (original genomes and their indices preserved; 50 new genomes appended for FAST evaluation)
+PASS: full v20/v21 checkpoint restores under v22 before objective reset and 400 -> 450 expansion
+PASS: 400 -> 450 expansion and 500 -> 450 trimming; original genome/stream alignment preserved
+PASS: legacy checkpoint layouts read and v22 rule round-trip aligned
+PASS: 256-token permutation and reversible recoding
+PASS: mapping-aware score, donor transplant and parent immutability
+PASS: injection mutation and crossover remain collision-free
+PASS: v17 raw-byte checkpoint migration preserves token length
+PASS: v24 512-token genome preserves its coordinates and round-trips
+PASS: v22 1024-token embedding migrates to collision-free 256-byte map
+PASS: v22 serialized genome is migrated through readGenome(version=22)
+PASS: v18 four-octal checkpoint migration and v22 round-trip
+PASS: v19 three-octal checkpoint migration to single-byte tokens

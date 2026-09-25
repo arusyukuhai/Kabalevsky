@@ -1,0 +1,519 @@
+--- /tmp/v26_before_refinement.nim	2026-09-25 16:01:42.244338981 +0900
++++ work/jev_embedding256/at_jev.nim	2026-09-25 16:06:38.674831614 +0900
+@@ -14,7 +14,8 @@
+ # v23: shrink that space to 512 symbols (256 mapped + 256 latent); arithmetic
+ #      closes modulo 512 and the sparse two-token candidate index is retained.
+ # v25: 256-token permutation; adaptive fusion and v24 migration.
+-# v26/V11: four new capture filters; v25 objective and history preserved.
++# v26/V11: four new capture filters.
++# v27/V12: restored 512-token injection; exact aggregate fast paths.
+ # Audit: bounded parent pools, exact-duplicate rescue, cached distance minima.
+ # Build: nim c -d:release --threads:on at.nim
+ # Verify: ./at --regression-test && ./at --self-test
+@@ -147,14 +148,13 @@
+ 
+   Genome = seq[Rule]
+ 
+-# External bytes and internal tokens each have 256 values. The embedding is
+-# a learned permutation of 0..255; 256 is reserved for OOV.
++# 256 external bytes inject into 512 internal tokens; 512 is reserved for OOV.
+ const INPUT_BYTE_COUNT = 256
+ const EMBEDDING_ENTRY_COUNT = INPUT_BYTE_COUNT # dictionary entries: one per raw byte
+-const EMBEDDING_SIZE = 256                     # internal token vocabulary 0..255
++const EMBEDDING_SIZE = 512                     # internal token vocabulary 0..511
+ const EMBEDDING_WIDTH = 1
+ const EMBEDDING_CODE_COUNT = EMBEDDING_SIZE
+-const EMBEDDING_OOV = EMBEDDING_CODE_COUNT     # sentinel 256
++const EMBEDDING_OOV = EMBEDDING_CODE_COUNT     # sentinel 512
+ const INDEX_TOKEN_COUNT = EMBEDDING_CODE_COUNT + 1
+ # v22 used a 1024-symbol internal vocabulary. It remains loadable through an
+ # explicit lossy latent-space migration which preserves all 256 byte identities.
+@@ -174,7 +174,7 @@
+   for i, v in e: result[i] = v
+ 
+ proc validEmbedding(e: openArray[int]): bool =
+-  ## A permutation: exactly 256 distinct destinations chosen from 256 tokens.
++  ## Injection: exactly 256 distinct destinations chosen from 512 tokens.
+   if e.len != EMBEDDING_ENTRY_COUNT: return false
+   var seen: array[EMBEDDING_CODE_COUNT, bool]
+   for code in e:
+@@ -210,7 +210,7 @@
+   true
+ 
+ proc migrateWideEmbedding(oldMap: openArray[int], codeCount: int): tuple[mapping, translation: seq[int]] =
+-  ## Preserve every byte identity; old latent symbols must share byte slots.
++  ## Preserve every byte identity; fold excess old latents into latent slots only.
+   if codeCount notin [V24_EMBEDDING_CODE_COUNT, V22_EMBEDDING_CODE_COUNT] or
+       not validWideEmbedding(oldMap, codeCount):
+     raise newException(IOError, "Invalid wide embedding.")
+@@ -224,20 +224,35 @@
+     result.mapping[b] = target
+     occupied[target] = true
+     result.translation[oldMap[b]] = target
++  var latent: seq[int] = @[]
++  for token in 0 ..< EMBEDDING_CODE_COUNT:
++    if not occupied[token]: latent.add(token)
+   for token in 0 ..< codeCount:
+     if result.translation[token] < 0:
+-      result.translation[token] = token mod EMBEDDING_CODE_COUNT
++      # Only fold into latent coordinates, never into a mapped byte identity.
++      result.translation[token] = if codeCount == EMBEDDING_CODE_COUNT: token
++                                  else: latent[token mod latent.len]
+   result.translation[codeCount] = EMBEDDING_OOV
+   doAssert validEmbedding(result.mapping)
+ 
+ proc embeddingTranslation(fromMap, toMap: openArray[int]): array[EMBEDDING_CODE_COUNT, int] =
+-  ## A 256-entry byte permutation determines the entire token translation.
++  ## Complete the byte injection into a bijection over all 512 coordinates.
+   doAssert validEmbedding(fromMap) and validEmbedding(toMap)
+   result.fill(-1)
+   var targetTaken: array[EMBEDDING_CODE_COUNT, bool]
+   for b in 0 ..< EMBEDDING_ENTRY_COUNT:
+     result[fromMap[b]] = toMap[b]
+     targetTaken[toMap[b]] = true
++  for token in 0 ..< EMBEDDING_CODE_COUNT:
++    if result[token] < 0 and not targetTaken[token]:
++      result[token] = token
++      targetTaken[token] = true
++  var target = 0
++  for token in 0 ..< EMBEDDING_CODE_COUNT:
++    if result[token] < 0:
++      while targetTaken[target]: inc target
++      result[token] = target
++      targetTaken[target] = true
+   doAssert targetTaken.allIt(it)
+ 
+ 
+@@ -252,7 +267,7 @@
+     result.add(mapped)
+ 
+ proc embedBytesInto(input: openArray[int], e: openArray[int], dst: var seq[int]) {.inline.} =
+-  ## Never expand text. Sentinel 256 is distinct from all internal tokens.
++  ## Never expand text. Sentinel 512 is distinct from all internal tokens.
+   dst.setLen(input.len)
+   for i, v in input:
+     dst[i] = (if v >= 0 and v < INPUT_BYTE_COUNT: e[v] else: EMBEDDING_OOV)
+@@ -1262,13 +1277,36 @@
+           outp[dst + j] = (if v >= 0 and v < EMBEDDING_CODE_COUNT:
+             (EMBEDDING_CODE_COUNT - v) mod EMBEDDING_CODE_COUNT else: v)
+       elif op.kind == 10'u8:
+-        # Reuse the existing worker-local buffer; no per-call allocation
+-        # once capacity is sufficient. Even-length median averages both centres.
+-        scratch.sortBuf.setLen(c.len)
+-        copyMem(addr scratch.sortBuf[0], unsafeAddr input[c.start], c.len * sizeof(int))
+-        sort(scratch.sortBuf)
+-        let mid = c.len div 2
+-        let twice = int64(scratch.sortBuf[mid]) + int64(scratch.sortBuf[(c.len - 1) div 2])
++        # Histogram beats sorting for long captures in the finite token space.
++        # Keep exact sorting for short captures and unusual/out-of-domain input.
++        var twice: int64
++        var histogramUsed = false
++        if c.len >= 128:
++          var counts: array[EMBEDDING_CODE_COUNT + 1, int]
++          var inDomain = true
++          for j in 0 ..< c.len:
++            let v = input[c.start + j]
++            if v < 0 or v > EMBEDDING_CODE_COUNT:
++              inDomain = false
++              break
++            inc counts[v]
++          if inDomain:
++            let loRank = (c.len - 1) div 2
++            let hiRank = c.len div 2
++            var seen = 0
++            var lo = -1
++            for v, frequency in counts:
++              seen += frequency
++              if lo < 0 and seen > loRank: lo = v
++              if seen > hiRank:
++                twice = int64(lo) + int64(v)
++                break
++            histogramUsed = true
++        if not histogramUsed:
++          scratch.sortBuf.setLen(c.len)
++          copyMem(addr scratch.sortBuf[0], unsafeAddr input[c.start], c.len * sizeof(int))
++          sort(scratch.sortBuf)
++          twice = int64(scratch.sortBuf[c.len div 2]) + int64(scratch.sortBuf[(c.len - 1) div 2])
+         let value = int(twice div 2 - (if twice < 0 and twice mod 2 != 0: 1 else: 0))
+         for j in 0 ..< c.len: outp[dst + j] = value
+       else:
+@@ -1280,12 +1318,13 @@
+           # Unconditional: every position, including OOV, becomes the mean.
+           for j in 0 ..< c.len: outp[dst + j] = value
+         else:
+-          let denominator = 2 * count
++          # For integer x: floor((x + mean)/2) == floor((x + floor(mean))/2).
++          # The fractional remainder is <1/2 and cannot cross the next integer.
++          # Thus one division per capture replaces one division per element.
++          let meanFloor = total div count - (if total < 0 and total mod count != 0: 1 else: 0)
+           for j in 0 ..< c.len:
+-            # floor((x + exact_mean)/2), rounding ONCE, using integer arithmetic.
+-            let numerator = int64(input[c.start + j]) * count + total
+-            outp[dst + j] = int(numerator div denominator -
+-              (if numerator < 0 and numerator mod denominator != 0: 1 else: 0))
++            let sum = int64(input[c.start + j]) + meanFloor
++            outp[dst + j] = int(sum div 2 - (if sum < 0 and sum mod 2 != 0: 1 else: 0))
+     else:
+       raise newException(SeqReplaceError, "Unknown replacement opcode")
+ 
+@@ -2193,9 +2232,9 @@
+   ## -1..-15  = direct backreferences ($1..$15)
+   ## -16..-31 = sort($1)..sort($16)
+   ## -32..-47 = reverse($1)..reverse($16)
+-  ## -48..-63 = ($1..$16) + 1 (mod 256 on internal tokens)
+-  ## -64..-79 = ($1..$16) - 1 (mod 256 on internal tokens)
+-  ## -80..-95 = ($1..$16) * 2 (mod 256 on internal tokens)
++  ## -48..-63 = ($1..$16) + 1 (mod 512 on internal tokens)
++  ## -64..-79 = ($1..$16) - 1 (mod 512 on internal tokens)
++  ## -80..-95 = ($1..$16) * 2 (mod 512 on internal tokens)
+   ## -96..-111 = ($1..$16) // 2 (integer floor)
+   ## -112..-127 = modular negation; -128..-143 = mean fill
+   ## -144..-159 = median fill; -160..-175 = contraction about exact mean
+@@ -3317,7 +3356,7 @@
+     g[i].weight = signPreservingWeight(oldWeight, proposed)
+ 
+ proc applyEmbeddingChange(g: var Genome, newMap: seq[int], preservePercent: int) =
+-  ## Recode coadapted rules through the complete 256-coordinate permutation.
++  ## Recode coadapted rules through the complete 512-coordinate permutation.
+   ## Symbols displaced by a newly mapped
+   ## byte are moved into the byte's vacated/free coordinate instead of colliding.
+   if g.len == 0 or g[0].embedding == newMap: return
+@@ -3358,6 +3397,14 @@
+   if g.len == 0 or g[0].embedding.len != EMBEDDING_ENTRY_COUNT: return
+   if rand(999) >= int(min(160.0, 45.0 * mutationScale)): return
+   var newMap = cloneEmbedding(g[0].embedding)
++  var occupied: array[EMBEDDING_CODE_COUNT, bool]
++  for code in newMap: occupied[code] = true
++  var freeCodes: array[EMBEDDING_CODE_COUNT - EMBEDDING_ENTRY_COUNT, int]
++  var freeCount = 0
++  for code in 0 ..< EMBEDDING_CODE_COUNT:
++    if not occupied[code]:
++      freeCodes[freeCount] = code
++      inc freeCount
+   let changed = sampleLogUniformMutationRange(1, EMBEDDING_ENTRY_COUNT)
+   for _ in 0 ..< changed:
+     let roll = rand(99)
+@@ -3366,10 +3413,9 @@
+       let other = (byte + 1 + rand(EMBEDDING_ENTRY_COUNT - 2)) mod EMBEDDING_ENTRY_COUNT
+       swap(newMap[byte], newMap[other])
+     elif roll < 90:
+-      let a = rand(EMBEDDING_ENTRY_COUNT - 1)
+-      let b = rand(EMBEDDING_ENTRY_COUNT - 2)
+-      let other = if b >= a: b + 1 else: b
+-      swap(newMap[a], newMap[other])
++      let byte = rand(EMBEDDING_ENTRY_COUNT - 1)
++      let freeIndex = rand(freeCount - 1)
++      swap(newMap[byte], freeCodes[freeIndex])
+     else:
+       let length = sampleLogUniformMutationRange(2, EMBEDDING_ENTRY_COUNT)
+       let start = rand(EMBEDDING_ENTRY_COUNT - length)
+@@ -3465,12 +3511,20 @@
+         g[p].patternRevision = freshPatternRevision()
+       if replacementOnly or rand(100) < 65:
+         g[p].b = cloneInts(g[p].b)
+-        var filterPositions: seq[int] = @[]
++        var filterCount = 0
+         if replacementOnly:
+-          for j, v in g[p].b:
+-            if v < 0 and v >= MIN_REPLACEMENT_OPCODE: filterPositions.add(j)
+-        if filterPositions.len > 0 and rand(99) < 70:
+-          let j = filterPositions[rand(filterPositions.len - 1)]
++          for v in g[p].b:
++            if v < 0 and v >= MIN_REPLACEMENT_OPCODE: inc filterCount
++        if filterCount > 0 and rand(99) < 70:
++          # Same uniform choice and RNG consumption, without a temporary seq.
++          var selected = rand(filterCount - 1)
++          var j = 0
++          while j < g[p].b.len:
++            let v = g[p].b[j]
++            if v < 0 and v >= MIN_REPLACEMENT_OPCODE:
++              if selected == 0: break
++              dec selected
++            inc j
+           let old = g[p].b[j]
+           let capture = replacementCaptureNumber(old)
+           let oldFamily = if old >= -15: 0 else: 1 + (-old - 16) div 16
+@@ -5670,8 +5724,8 @@
+     fixedMovingAvg: float
+ 
+ const CHECKPOINT_MAGIC = "KLEISMIC_GA_CHECKPOINT"
+-const CHECKPOINT_VERSION = 26
+-const CHECKPOINT_OBJECTIVE_VERSION = 25 # 256-token objective
++const CHECKPOINT_VERSION = 27
++const CHECKPOINT_OBJECTIVE_VERSION = 27 # 512-token objective
+ var migratedRuleCount = false
+ var loadedCheckpointVersion = 0
+ const CHECKPOINT_INTERVAL = 50
+@@ -5740,15 +5794,15 @@
+   if version >= 20:
+     let storedMapping = readIntSeq(s)
+     let mappingValid =
+-      if version <= 21: validLegacyBytePermutation(storedMapping)
++      if version <= 21 or version in [25, 26]: validLegacyBytePermutation(storedMapping)
+       elif version == 22: validV22Embedding(storedMapping)
+       elif version in [23, 24]: validWideEmbedding(storedMapping, V24_EMBEDDING_CODE_COUNT)
+       else: validEmbedding(storedMapping)
+     if not mappingValid:
+       raise newException(IOError, "Invalid or duplicate embedding in checkpoint/model.")
+     if n > 0:
+-      if version <= 21:
+-        # v20/v21 stored positive literal 256 as OOV; preserve that sentinel.
++      if version <= 21 or version in [25, 26]:
++        # v20/v21/v25/v26 stored positive literal 256 as OOV; preserve that sentinel.
+         for i in 0 ..< n:
+           var changedA = false
+           var changedB = false
+@@ -6240,7 +6294,7 @@
+       raise newException(IOError, "Invalid checkpoint magic: " & path)
+ 
+     let version = int(fs.readInt64())
+-    if version < 3 or (version > 9 and version notin [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, CHECKPOINT_VERSION]):
++    if version < 3 or (version > 9 and version notin [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, CHECKPOINT_VERSION]):
+       raise newException(IOError, "Unsupported checkpoint version: " & $version)
+ 
+     nextIter = int(fs.readInt64())
+@@ -6625,7 +6679,8 @@
+ const ENERGY_MODEL_MAGIC_V8 = "KLEISMIC_ENERGY_V8"
+ const ENERGY_MODEL_MAGIC_V9 = "KLEISMIC_ENERGY_V9"
+ const ENERGY_MODEL_MAGIC_V10 = "KLEISMIC_ENERGY_V10"
+-const ENERGY_MODEL_MAGIC = "KLEISMIC_ENERGY_V11"
++const ENERGY_MODEL_MAGIC_V11 = "KLEISMIC_ENERGY_V11"
++const ENERGY_MODEL_MAGIC = "KLEISMIC_ENERGY_V12"
+ const GENERATION_ISLANDS = 4
+ const GENERATION_NGRAM_LIMIT = 512
+ # Text search must never inherit the 10-second TRAINING watchdog per proposal.
+@@ -6926,12 +6981,13 @@
+ type EnergyModelData = tuple[genome: Genome, alphabet, frequencies: seq[int], grams: seq[GenerationGram]]
+ 
+ proc readEnergyModelBody(stream: Stream, header: string): EnergyModelData =
+-  if header notin [ENERGY_MODEL_MAGIC, ENERGY_MODEL_MAGIC_V10, ENERGY_MODEL_MAGIC_V9, ENERGY_MODEL_MAGIC_V8,
++  if header notin [ENERGY_MODEL_MAGIC, ENERGY_MODEL_MAGIC_V11, ENERGY_MODEL_MAGIC_V10, ENERGY_MODEL_MAGIC_V9, ENERGY_MODEL_MAGIC_V8,
+       ENERGY_MODEL_MAGIC_V7, ENERGY_MODEL_MAGIC_V6, ENERGY_MODEL_MAGIC_V5,
+       ENERGY_MODEL_MAGIC_V4, ENERGY_MODEL_MAGIC_V3, ENERGY_MODEL_MAGIC_V2, ENERGY_MODEL_MAGIC_V1]:
+-    raise newException(IOError, "Expected a V1..V11 .model file, not a GA checkpoint.")
++    raise newException(IOError, "Expected a V1..V12 .model file, not a GA checkpoint.")
+   let modelVersion =
+     if header == ENERGY_MODEL_MAGIC: CHECKPOINT_VERSION
++    elif header == ENERGY_MODEL_MAGIC_V11: 26
+     elif header == ENERGY_MODEL_MAGIC_V10: 25
+     elif header == ENERGY_MODEL_MAGIC_V9: 24
+     elif header == ENERGY_MODEL_MAGIC_V8: 22
+@@ -6985,12 +7041,13 @@
+   if prefix == ENERGY_MODEL_MAGIC_V1:
+     let bodyStart = stream.getPosition()
+     let suffix = stream.readStr(1)
+-    if suffix in ["0", "1"]:
++    if suffix in ["0", "1", "2"]:
+       # V1 rule counts 48/49 (and 304/305) collide with V10/V11 prefixes.
+       # Accept the longer header only after validating its complete body.
+       try:
+         return readEnergyModelBody(stream,
+-          if suffix == "0": ENERGY_MODEL_MAGIC_V10 else: ENERGY_MODEL_MAGIC)
++          if suffix == "0": ENERGY_MODEL_MAGIC_V10
++          elif suffix == "1": ENERGY_MODEL_MAGIC_V11 else: ENERGY_MODEL_MAGIC)
+       except IOError:
+         discard
+     stream.setPosition(bodyStart)
+@@ -8226,7 +8283,7 @@
+     selectedOld.add(bestOld)
+     selectedNew.add(bestNew)
+   echo "PASS: incremental distance gives identical selected IDs; comparisons ",oldComparisons," -> ",scratch.comparisons
+-  for ruleCount in [1, 48, 49, 304, 305]:
++  for ruleCount in [1, 48, 49, 50, 304, 305, 306]:
+     let oldModel = newStringStream()
+     oldModel.write(ENERGY_MODEL_MAGIC_V1)
+     oldModel.write(ruleCount.int64)
+@@ -8254,7 +8311,7 @@
+     let paths=resolveCheckpointPaths(args)
+     doAssert paths.loadRequested and paths.loadPath=="old.bin" and paths.savePath=="new.bin"
+   doAssert resolveCheckpointPaths(@["--load=old.bin"]).savePath=="old.bin"
+-  echo "PASS: V1 headers (including ambiguous 48/49/304/305 rules), V11 model roundtrip, order-independent load/save"
++  echo "PASS: V1 headers (including ambiguous 48/49/304/305 rules), V12 model roundtrip, order-independent load/save"
+ 
+   var base=cloneGenome(pop[0])
+   var donor=cloneGenome(pop[1])
+@@ -8647,18 +8704,19 @@
+     let captures = @[Capture(start: 0, len: xs.len)]
+     appendReplacementPlan(result, addr plan, xs, captures, 1, scratch, overflow)
+     doAssert not overflow
+-  doAssert applyFilter(@[0, 1, 255, 256], -112) == @[0, 255, 1, 256]
++  doAssert applyFilter(@[0, 1, 511, 512], -112) == @[0, 511, 1, 512]
+   doAssert applyFilter(@[0, 1, 8], -128) == @[3, 3, 3]
+   doAssert applyFilter(@[0, 1, 8], -144) == @[1, 1, 1]
+   doAssert applyFilter(@[0, 1, 8], -160) == @[1, 2, 5]
+   doAssert applyFilter(@[0, 3], -160) == @[0, 2] # no premature rounding
+-  doAssert applyFilter(@[255, 256], -128) == @[255, 255] # unconditional OOV fill
+-  doAssert applyFilter(@[255, 256], -144) == @[255, 255]
++  doAssert applyFilter(@[511, 512], -128) == @[511, 511] # unconditional OOV fill
++  doAssert applyFilter(@[511, 512], -144) == @[511, 511]
+   doAssert applyFilter(@[-3, 0], -128) == @[-2, -2]
+   doAssert applyFilter(@[-3, 0], -160) == @[-3, -1]
+   for trial in 0 ..< 1000:
+     var xs: seq[int]
+-    for j in 0 ..< rand(128): xs.add(rand(EMBEDDING_CODE_COUNT))
++    for j in 0 ..< rand(2048):
++      xs.add(if trial mod 4 == 0: rand(2048)-512 else: rand(EMBEDDING_CODE_COUNT))
+     var ordered = cloneInts(xs)
+     ordered.sort()
+     var total = 0.0
+@@ -8669,11 +8727,38 @@
+       doAssert actual.len == xs.len
+       for j, x in xs:
+         let expected = case family
+-          of 0: (if x == EMBEDDING_OOV: x else: (EMBEDDING_CODE_COUNT-x) mod EMBEDDING_CODE_COUNT)
++          of 0: (if x < 0 or x >= EMBEDDING_CODE_COUNT: x else: (EMBEDDING_CODE_COUNT-x) mod EMBEDDING_CODE_COUNT)
+           of 1: int(floor(total / float(xs.len)))
+           of 2: int(floor((float(ordered[xs.len div 2]) + float(ordered[(xs.len-1) div 2])) / 2.0))
+           else: int(floor((float(x) + total/float(xs.len))/2.0))
+         doAssert actual[j] == expected
++  # Full 512-space mapping must be bijective AND reversible, including latents.
++  for trial in 0 ..< 100:
++    var codesA, codesB: seq[int]
++    for i in 0 ..< EMBEDDING_CODE_COUNT:
++      codesA.add(i)
++      codesB.add(i)
++    shuffle(codesA)
++    shuffle(codesB)
++    let mapA = codesA[0 ..< EMBEDDING_ENTRY_COUNT]
++    let mapB = codesB[0 ..< EMBEDDING_ENTRY_COUNT]
++    let forward = embeddingTranslation(mapA,mapB)
++    let reverse = embeddingTranslation(mapB,mapA)
++    var used: array[EMBEDDING_CODE_COUNT,bool]
++    for i in 0 ..< EMBEDDING_CODE_COUNT:
++      doAssert not used[forward[i]]
++      used[forward[i]] = true
++      doAssert reverse[forward[i]] == i
++    for b in 0 ..< EMBEDDING_ENTRY_COUNT: doAssert forward[mapA[b]] == mapB[b]
++  block:
++    var g: Genome = @[Rule(a: @[0], b: @[1], weight:1.0, embedding:defaultEmbedding())]
++    var reachedUpper = false
++    for trial in 0 ..< 200:
++      mutateEmbedding(g,1000.0)
++      doAssert validEmbedding(g[0].embedding)
++      for v in g[0].embedding:
++        if v >= INPUT_BYTE_COUNT: reachedUpper = true
++    doAssert reachedUpper
+   # All sixteen captures, validity repair, output limits and invalid slices.
+   for family in 0 .. 3:
+     for cap in 1 .. 16:
+@@ -8749,16 +8834,16 @@
+     let p1 = @[alphabet[0]]
+     for trial in 0 ..< 100:
+       doAssert generationOffspring(p1,p1,2,1,alphabet,cumulative,@[]) != p1
+-  echo "PASS: 4000 randomized filter comparisons, all 16 captures, bounds/OOV/rounding, 2000 mutation trials, crossover immutability, V10/V11 roundtrips, real offspring novelty"
++  echo "PASS: 4000 randomized filter comparisons (length 0..2048, signed/OOV), 100 full-space reversible mappings, upper-half reachability, all 16 captures, bounds/OOV/rounding, 2000 mutation trials, crossover immutability, V10/V12 roundtrips, real offspring novelty"
+   quit(0)
+ 
+ if "--regression-test" in commandLineParams():
+   doAssert INPUT_BYTE_COUNT == 256
+   doAssert EMBEDDING_ENTRY_COUNT == 256
+-  doAssert EMBEDDING_SIZE == 256
+-  doAssert EMBEDDING_CODE_COUNT == 256
+-  doAssert EMBEDDING_OOV == 256
+-  doAssert INDEX_TOKEN_COUNT == 257
++  doAssert EMBEDDING_SIZE == 512
++  doAssert EMBEDDING_CODE_COUNT == 512
++  doAssert EMBEDDING_OOV == 512
++  doAssert INDEX_TOKEN_COUNT == 513
+   proc testRule(a, b: seq[int], w: float): Rule =
+     Rule(a: a, b: b, weight: w,
+       patternRevision: freshPatternRevision(),
+@@ -8841,15 +8926,15 @@
+       @[2, 4, 8, 8, 4, 2, 3, 5, 9, 1, 3, 7, 4, 8, 16, 1, 2, 4]
+   doAssert replaceSeq(@[97, -3, -2, -1, 98], arithmeticPattern,
+     @[-96]) == @[-2, -1, -1] # True floor division on negative tokens
+-  # Internal arithmetic lives in Z/256Z; only 256 is OOV.
+-  doAssert replaceSeq(@[97, 0, 255, 254, EMBEDDING_OOV, 98], arithmeticPattern,
+-    @[-48]) == @[1, 0, 255, EMBEDDING_OOV]
+-  doAssert replaceSeq(@[97, 0, 255, 254, EMBEDDING_OOV, 98], arithmeticPattern,
+-    @[-64]) == @[255, 254, 253, EMBEDDING_OOV]
+-  doAssert replaceSeq(@[97, 0, 255, 254, EMBEDDING_OOV, 98], arithmeticPattern,
+-    @[-80]) == @[0, 254, 252, EMBEDDING_OOV]
+-  doAssert replaceSeq(@[97, 0, 255, 254, EMBEDDING_OOV, 98], arithmeticPattern,
+-    @[-96]) == @[0, 127, 127, EMBEDDING_OOV]
++  # Internal arithmetic lives in Z/512Z; only 512 is OOV.
++  doAssert replaceSeq(@[97, 0, 511, 510, EMBEDDING_OOV, 98], arithmeticPattern,
++    @[-48]) == @[1, 0, 511, EMBEDDING_OOV]
++  doAssert replaceSeq(@[97, 0, 511, 510, EMBEDDING_OOV, 98], arithmeticPattern,
++    @[-64]) == @[511, 510, 509, EMBEDDING_OOV]
++  doAssert replaceSeq(@[97, 0, 511, 510, EMBEDDING_OOV, 98], arithmeticPattern,
++    @[-80]) == @[0, 510, 508, EMBEDDING_OOV]
++  doAssert replaceSeq(@[97, 0, 511, 510, EMBEDDING_OOV, 98], arithmeticPattern,
++    @[-96]) == @[0, 255, 255, EMBEDDING_OOV]
+   var allInternalTokens: seq[int] = @[2000]
+   for token in 0 ..< EMBEDDING_CODE_COUNT: allInternalTokens.add(token)
+   allInternalTokens.add(2001)
+@@ -8869,7 +8954,7 @@
+     @[-48, -64, -80]) ==
+       @[high(int), low(int), high(int), low(int),
+         high(int), low(int)]
+-  echo "PASS: modulo-256 capture arithmetic, latent tokens and OOV safety"
++  echo "PASS: modulo-512 capture arithmetic, latent tokens and OOV safety"
+   # Log-uniform event sizes are sampled from the actual genome length,
+   # including 1 and N; distinct mutation targets cannot silently collapse.
+   doAssert sampleLogUniformMutationCount(0) == 0
+@@ -8959,14 +9044,14 @@
+     # Sparse index must handle latent IDs near the top of the 512-token space
+     # without allocating a 513^2 dense table.
+     let latentPatterns = @[
+-      compileSeqPattern(@[250]),
+-      compileSeqPattern(@[250, 255]),
+-      compileSeqPattern(@[255, 250]),
++      compileSeqPattern(@[500]),
++      compileSeqPattern(@[500, 511]),
++      compileSeqPattern(@[511, 500]),
+       compileSeqPattern(@[EMBEDDING_OOV])
+     ]
+     let latentIndex = buildCandidateIndex(latentPatterns)
+     var latentScratch = newEvalScratch(latentPatterns.len)
+-    scanCandidateIds(latentIndex, @[250, 255], latentScratch.candidateIds,
++    scanCandidateIds(latentIndex, @[500, 511], latentScratch.candidateIds,
+       latentScratch.candidateScratch)
+     doAssert 0 in latentScratch.candidateIds
+     doAssert 1 in latentScratch.candidateIds
+@@ -8975,7 +9060,7 @@
+     scanCandidateIds(latentIndex, @[EMBEDDING_OOV], latentScratch.candidateIds,
+       latentScratch.candidateScratch)
+     doAssert 3 in latentScratch.candidateIds
+-  echo "PASS: sparse candidate index covers 256 internal tokens plus OOV"
++  echo "PASS: sparse candidate index covers 512 internal tokens plus OOV"
+   block:
+     let literal = makeLiteral(@[97, 97])
+     var cursor = LiteralCursor(lastMatch: -1, nextSearch: 0, exhausted: false)
+@@ -9714,14 +9799,14 @@
+     let converted = readGenome(old, 24)
+     old.close()
+     doAssert validEmbedding(converted[0].embedding)
+-    doAssert converted[0].a == @[converted[0].embedding[65], 7, 255, EMBEDDING_OOV, -48]
++    doAssert converted[0].a == @[converted[0].embedding[65], 7, 511, EMBEDDING_OOV, -48]
+     doAssert converted[0].b[0] == converted[0].embedding[66]
+     let roundTrip = newStringStream()
+     writeGenome(roundTrip, converted)
+     roundTrip.setPosition(0)
+     doAssert sameGenomeContent(converted, readGenome(roundTrip, CHECKPOINT_VERSION))
+     roundTrip.close()
+-  echo "PASS: v24 512-token genome migrates to 256-token permutation and round-trips"
++  echo "PASS: v24 512-token genome preserves its coordinates and round-trips"
+   block:
+     var oldV22Map = newSeq[int](EMBEDDING_ENTRY_COUNT)
+     for i in 0 ..< EMBEDDING_ENTRY_COUNT:
+@@ -9921,8 +10006,8 @@
+     progressHistory.setLen(0)
+     echo "[migration] legacy rule count expanded (population/archive); plot history restarted"
+   if loadedCheckpointVersion < CHECKPOINT_OBJECTIVE_VERSION:
+-    # 256 internal symbols change the objective. Historical latent symbols
+-    # fold onto byte coordinates; previous scores and Jev trust cannot carry over.
++    # Arithmetic now closes in 512 rather than 256 tokens. Even when byte
++    # coordinates are unchanged, previous scores and Jev trust are not comparable.
+     progressHistory.setLen(0)
+     eliteOfElites.setLen(0)
+     jevHall.setLen(0)
+@@ -9931,7 +10016,7 @@
+     maReset()
+     bestEver = -Inf
+     stagnation = 0
+-    echo "[migration] v25 256-token objective: old scores/archive/Jev Hall discarded; genomes migrated"
++    echo "[migration] v27 512-token objective: old scores/archive/Jev Hall discarded; genomes migrated"
+   if loadedCheckpointVersion < 16:
+     # Remove stale history and old-objective archives; preserve population.
+     # Archival genomes were selected by incompatible branch scores.

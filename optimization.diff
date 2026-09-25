@@ -1,0 +1,1513 @@
+--- previous/at_jev.nim
++++ optimized/at_jev.nim
+@@ -13,6 +13,8 @@
+ # v22: 256 raw bytes injected into a 1024-symbol internal space.
+ # v23: shrink that space to 512 symbols (256 mapped + 256 latent); arithmetic
+ #      closes modulo 512 and the sparse two-token candidate index is retained.
++# v25: 256-token permutation; adaptive fusion and v24 migration.
++# Audit: bounded parent pools, exact-duplicate rescue, cached distance minima.
+ # Build: nim c -d:release --threads:on at.nim
+ # Verify: ./at --regression-test && ./at --self-test
+ 
+@@ -139,22 +141,19 @@
+     patternRevision: uint64
+     replacementRevision: uint64
+     # Only genome[0] owns the mapping; ordinary rules do not duplicate it.
+-    # 256 input bytes inject into 512 internal token IDs. The unused IDs are
+-    # genuine latent/work symbols available to the rewrite system.
++    # 256 input bytes map bijectively onto internal token IDs 0..255.
+     embedding: seq[int]
+ 
+   Genome = seq[Rule]
+ 
+-# External data remains byte-oriented, but the rewrite machine operates in a
+-# larger discrete latent space. `embedding` is a 256-entry injection into the
+-# 512-symbol internal vocabulary.  Exactly half of the vocabulary is therefore
+-# initially free for latent/work symbols; 512 itself is the OOV sentinel.
++# External bytes and internal tokens each have 256 values. The embedding is
++# a learned permutation of 0..255; 256 is reserved for OOV.
+ const INPUT_BYTE_COUNT = 256
+ const EMBEDDING_ENTRY_COUNT = INPUT_BYTE_COUNT # dictionary entries: one per raw byte
+ const EMBEDDING_SIZE = 256                     # internal token vocabulary 0..255
+ const EMBEDDING_WIDTH = 1
+ const EMBEDDING_CODE_COUNT = EMBEDDING_SIZE
+-const EMBEDDING_OOV = EMBEDDING_CODE_COUNT     # sentinel 512
++const EMBEDDING_OOV = EMBEDDING_CODE_COUNT     # sentinel 256
+ const INDEX_TOKEN_COUNT = EMBEDDING_CODE_COUNT + 1
+ # v22 used a 1024-symbol internal vocabulary. It remains loadable through an
+ # explicit lossy latent-space migration which preserves all 256 byte identities.
+@@ -165,8 +164,7 @@
+ const LEGACY_OCTAL4_CODE_COUNT = 4096
+ 
+ proc defaultEmbedding(): seq[int] =
+-  ## Backward-compatible aligned start: bytes initially occupy tokens 0..255;
+-  ## 256..511 begin as free latent coordinates.
++  ## Start with the identity permutation of bytes 0..255.
+   result = newSeq[int](EMBEDDING_ENTRY_COUNT)
+   for i in 0 ..< EMBEDDING_ENTRY_COUNT: result[i] = i
+ 
+@@ -175,7 +173,7 @@
+   for i, v in e: result[i] = v
+ 
+ proc validEmbedding(e: openArray[int]): bool =
+-  ## Injection: exactly 256 distinct destinations chosen from 512 tokens.
++  ## A permutation: exactly 256 distinct destinations chosen from 256 tokens.
+   if e.len != EMBEDDING_ENTRY_COUNT: return false
+   var seen: array[EMBEDDING_CODE_COUNT, bool]
+   for code in e:
+@@ -253,7 +251,7 @@
+     result.add(mapped)
+ 
+ proc embedBytesInto(input: openArray[int], e: openArray[int], dst: var seq[int]) {.inline.} =
+-  ## Never expand text. Sentinel 512 is distinct from all internal tokens.
++  ## Never expand text. Sentinel 256 is distinct from all internal tokens.
+   dst.setLen(input.len)
+   for i, v in input:
+     dst[i] = (if v >= 0 and v < INPUT_BYTE_COUNT: e[v] else: EMBEDDING_OOV)
+@@ -446,6 +444,7 @@
+     usedSlots: seq[int32]  # clear only occupied slots on rebuild
+     mask: int
+     count: int
++    presentBits: seq[uint64] # exact key membership, 257^2 bits at embedding 256
+ 
+   # One-token buckets remain dense (513 entries is tiny), while two-token
+   # buckets are sparse. A dense 513^2 table per genome would still waste memory across 450 genomes despite only ~1500 rule anchors being used.
+@@ -472,6 +471,7 @@
+   result.usedSlots = newSeqOfCap[int32](max(1, expectedEntries))
+   result.mask = cap - 1
+   result.count = 0
++  result.presentBits = newSeq[uint64]((INDEX_TOKEN_COUNT * INDEX_TOKEN_COUNT + 63) div 64)
+ 
+ proc pairHeadSlot(h: PairHeadIndex, key: int): int {.inline.} =
+   # pairKey <= 263,168. Multiplicative hashing avoids the regular 513 stride
+@@ -480,6 +480,7 @@
+ 
+ proc pairHeadGet(h: PairHeadIndex, key: int): int32 {.inline.} =
+   if h.keys.len == 0: return 0'i32
++  if (h.presentBits[key shr 6] and (1'u64 shl (key and 63))) == 0: return 0'i32
+   var slot = pairHeadSlot(h, key)
+   while true:
+     let stored = h.keys[slot]
+@@ -488,6 +489,7 @@
+     slot = (slot + 1) and h.mask
+ 
+ proc pairHeadPut(h: var PairHeadIndex, key: int, head: int32) {.inline.} =
++  h.presentBits[key shr 6] = h.presentBits[key shr 6] or (1'u64 shl (key and 63))
+   var slot = pairHeadSlot(h, key)
+   while true:
+     let stored = h.keys[slot]
+@@ -505,6 +507,8 @@
+ proc pairHeadClear(h: var PairHeadIndex) {.inline.} =
+   for rawSlot in h.usedSlots:
+     let slot = int(rawSlot)
++    let key = int(h.keys[slot])
++    h.presentBits[key shr 6] = h.presentBits[key shr 6] and not (1'u64 shl (key and 63))
+     h.keys[slot] = -1'i32
+     h.heads[slot] = 0'i32
+   h.usedSlots.setLen(0)
+@@ -568,6 +572,8 @@
+     r.head2 = initPairHeadIndex(patterns.len)
+     result = r
+ 
++  if result.head2.keys.len < max(32, patterns.len * 2):
++    result.head2 = initPairHeadIndex(patterns.len)
+   result.densePairHeads.setLen(0)
+   result.candidateRuleCount = patterns.len
+   result.head1.fill(0)
+@@ -2435,18 +2441,27 @@
+     embedding: r.embedding
+   )
+ 
+-proc transplantRule(donor: Rule, donorMap, childMap: seq[int]): Rule =
++type RuleTransplant = object
++  recode: bool
++  translation: array[EMBEDDING_CODE_COUNT, int]
++
++proc prepareRuleTransplant(donorMap, childMap: seq[int]): RuleTransplant =
++  result.recode = donorMap.len == EMBEDDING_ENTRY_COUNT and
++    childMap.len == EMBEDDING_ENTRY_COUNT and donorMap != childMap
++  if result.recode: result.translation = embeddingTranslation(donorMap, childMap)
++
++proc transplantRulePlanned(donor: Rule, plan: RuleTransplant): Rule =
+   result = cloneRuleShallow(donor)
+-  # The embedding belongs only to the genome; never inherit a displaced row's map.
+   result.embedding = @[]
+-  if donorMap.len == EMBEDDING_ENTRY_COUNT and childMap.len == EMBEDDING_ENTRY_COUNT and
+-      donorMap != childMap:
+-    # One 512-entry translation serves both a and b for this transplanted row.
+-    let translation = embeddingTranslation(donorMap, childMap)
+-    result.a = recodeLiteralRunsWithTranslation(donor.a, translation)
+-    result.b = recodeLiteralRunsWithTranslation(donor.b, translation)
++  if plan.recode:
++    result.a = recodeLiteralRunsWithTranslation(donor.a, plan.translation)
++    result.b = recodeLiteralRunsWithTranslation(donor.b, plan.translation)
+     result.patternRevision = freshPatternRevision()
+     result.replacementRevision = freshReplacementRevision()
++
++proc transplantRule(donor: Rule, donorMap, childMap: seq[int]): Rule =
++  transplantRulePlanned(donor, prepareRuleTransplant(donorMap, childMap))
++
+ 
+ proc cloneGenome(g: Genome): Genome =
+   ## 構造だけコピー。a/b は共有する。
+@@ -2568,6 +2583,58 @@
+     if not sameRule(a[i], b[i]) or a[i].weight != b[i].weight:
+       return false
+   true
++
++proc localRuleDistance(a, b: Rule): float {.inline.} =
++  var d = abs(a.a.len - b.a.len).float * 0.10
++  d += abs(a.b.len - b.b.len).float * 0.10
++  let na = min(4, min(a.a.len, b.a.len))
++  for k in 0 ..< na:
++    if a.a[k] != b.a[k]: d += 0.18
++  let nb = min(4, min(a.b.len, b.b.len))
++  for k in 0 ..< nb:
++    if a.b[k] != b.b[k]: d += 0.18
++  d += min(1.0, abs(a.weight - b.weight) / 4.0) * 0.08
++  d
++
++proc localGenomeDistance(a, b: Genome): float {.inline.} =
++  if a.len == 0 or b.len == 0: return 1.0
++  let probes = min(37, min(a.len, b.len))
++  if probes <= 0: return 0.0
++  var d = 0.0
++  for k in 0 ..< probes:
++    let ia = (k * (a.len - 1)) div max(1, probes - 1)
++    let ib = (k * (b.len - 1)) div max(1, probes - 1)
++    d += localRuleDistance(a[ia], b[ib])
++  d = d / probes.float
++  # Different byte dictionaries are also genuine genetic diversity.
++  if a[0].embedding.len == EMBEDDING_ENTRY_COUNT and
++      b[0].embedding.len == EMBEDDING_ENTRY_COUNT:
++    var mapDiff = 0
++    for byte in countup(0, EMBEDDING_ENTRY_COUNT - 1, 8):
++      if a[0].embedding[byte] != b[0].embedding[byte]: inc mapDiff
++    d += 0.50 * float(mapDiff) / 32.0
++  d
++
++type MinDistanceScratch = object
++  covered: seq[int]
++  minima: seq[float]
++  comparisons: int
++
++proc newMinDistanceScratch(count: int): MinDistanceScratch =
++  result.covered = newSeq[int](count)
++  result.minima = newSeq[float](count)
++  result.minima.fill(Inf)
++
++proc minimumSelectedDistance(population: seq[Genome], id: int,
++    selected: seq[int], scratch: var MinDistanceScratch): float =
++  ## Valid only while population is unchanged and selected grows by append.
++  ## Separate scratch objects are used before/after local weight refinement.
++  for i in scratch.covered[id] ..< selected.len:
++    scratch.minima[id] = min(scratch.minima[id],
++      localGenomeDistance(population[id], population[selected[i]]))
++    inc scratch.comparisons
++  scratch.covered[id] = selected.len
++  scratch.minima[id]
+ 
+ # Four mutually exclusive operators. A *genome* is an ordered sequence:
+ # two-point crossover acts on the rule sequence, not merely inside a/b.
+@@ -2728,9 +2795,10 @@
+   result = cloneGenome(base)
+   let n = min(base.len, donor.len)
+   if l < 0 or r > n or l >= r: return
++  let plan = prepareRuleTransplant(donor[0].embedding, base[0].embedding)
+   for i in l ..< r:
+     if compatibleRule(donor[i]):
+-      result[i] = transplantRule(donor[i], donor[0].embedding, base[0].embedding)
++      result[i] = transplantRulePlanned(donor[i], plan)
+   result[0].embedding = base[0].embedding
+   for i in 1 ..< result.len: result[i].embedding = @[]
+ 
+@@ -2739,8 +2807,7 @@
+   t1, t2: RuleTrace
+ ): Genome =
+   let n = min(p1.len, p2.len)
+-  result = cloneGenome(p1)
+-  if n == 0: return
++  if n == 0: return cloneGenome(p1)
+   if p1[0].embedding != p2[0].embedding and
+       op in {coHomologous, coModule}:
+     # Trace hashes and structural homology are coordinate-system dependent.
+@@ -2748,17 +2815,19 @@
+     let (l, r) = sampleCrossoverSegment(n)
+     result = twoPointGenomeCrossover(p1, p2, l, r)
+     return
++  let plan = prepareRuleTransplant(p2[0].embedding, p1[0].embedding)
+   case op
+   of coTwoPoint:
+     let (l, r) = sampleCrossoverSegment(n)
+-    result = twoPointGenomeCrossover(p1, p2, l, r)
++    return twoPointGenomeCrossover(p1, p2, l, r)
+   of coHomologous:
+     let matched = alignOrderedRules(p1, p2, t1, t2)
+     if matched.len == 0:
+       # Homology unavailable: use an ordinary sequence crossover, not a no-op.
+       let (l, r) = sampleCrossoverSegment(n)
+-      result = twoPointGenomeCrossover(p1, p2, l, r)
++      return twoPointGenomeCrossover(p1, p2, l, r)
+     else:
++      result = cloneGenome(p1)
+       let count = sampleCrossoverLength(matched.len)
+       let start = rand(matched.len - count)
+       for mi in start ..< start + count:
+@@ -2770,8 +2839,9 @@
+         else:
+           # Different a/b: inherit the entire donor rule.
+           if compatibleRule(p2[b]):
+-            result[a] = transplantRule(p2[b], p2[0].embedding, p1[0].embedding)
++            result[a] = transplantRulePlanned(p2[b], plan)
+   of coModule:
++    result = cloneGenome(p1)
+     # Favor active source interfaces; do not assume index == function.
+     var active: seq[int] = @[]
+     for i in 0 ..< min(n, t2.len):
+@@ -2819,8 +2889,9 @@
+         bestDst = dst
+     for j in 0 ..< length:
+       if compatibleRule(p2[src + j]):
+-        result[bestDst + j] = transplantRule(p2[src + j], p2[0].embedding, p1[0].embedding)
++        result[bestDst + j] = transplantRulePlanned(p2[src + j], plan)
+   of coMacro:
++    result = cloneGenome(p1)
+     # Non-homologous, full-range exploration: a single log-uniform block.
+     let length = sampleCrossoverLength(n)
+     let src = rand(n - length)
+@@ -2829,7 +2900,7 @@
+     for j in 0 ..< length:
+       let donorIdx = if reversed: src + length - j - 1 else: src + j
+       if compatibleRule(p2[donorIdx]):
+-        result[dst + j] = transplantRule(p2[donorIdx], p2[0].embedding, p1[0].embedding)
++        result[dst + j] = transplantRulePlanned(p2[donorIdx], plan)
+   # The mapping is a separate allele; row-0 replacement must not overwrite it.
+   result[0].embedding = p1[0].embedding
+   for i in 1 ..< result.len: result[i].embedding = @[]
+@@ -3449,6 +3520,22 @@
+   # ここで全ルールを再sanitizeするのは非常に重い。
+   # a/bを直接変える各mutation pathでは、そのruleだけ既にsanitize済み。
+   # crossover側もcompatibleRuleを通したruleしか移植しないので全走査は不要。
++
++proc diversifyExactCopy(g: var Genome) =
++  ## Explicit novelty event; preserve nonzero weight signs. Target count still
++  ## follows the full-range log-uniform distribution, including 1 and N.
++  if g.len == 0: return
++  for id in pickMutationTargets(g):
++    let oldWeight = g[id].weight
++    let step = 0.005 + min(0.1, abs(gaussianDelta(0.015)))
++    let magnitude = abs(oldWeight)
++    let next = if magnitude + step <= WEIGHT_ABS_LIMIT: magnitude + step
++               else: max(WEIGHT_SIGN_FLOOR, magnitude - step)
++    let sign = if oldWeight < 0: -1.0
++               elif oldWeight > 0: 1.0
++               elif rand(1) == 0: -1.0 else: 1.0
++    g[id].weight = sign * next
++
+ 
+ proc randomImmigrant(): Genome =
+   makeObj()
+@@ -4173,29 +4260,37 @@
+   useCount: var seq[int],
+   randomRate: float
+ ): int {.inline.} =
+-  ## 同じ親が世代内に過剰繁殖しないよう、まず通常選択し、
+-  ## 上限へ到達した個体は数回だけ引き直す。全員が上限なら
+-  ## 最小使用回数の親へフォールバックする。
+-  if candidateIds.len == 0:
+-    return -1
+-  for _ in 0 ..< 6:
+-    let id = selectParentId(caseScores, candidateIds, randomRate)
+-    if id < 0:
+-      return -1
+-    if id >= useCount.len or useCount[id] < PARENT_MAX_USES:
+-      if id >= 0 and id < useCount.len:
+-        inc useCount[id]
+-      return id
+-  var bestId = candidateIds[0]
+-  var bestUses = if bestId < useCount.len: useCount[bestId] else: 0
++  ## Select only eligible parents; an exhausted preferred pool returns -1.
++  var eligible = newSeqOfCap[int](candidateIds.len)
+   for id in candidateIds:
+-    let u = if id < useCount.len: useCount[id] else: 0
+-    if u < bestUses:
+-      bestUses = u
+-      bestId = id
+-  if bestId >= 0 and bestId < useCount.len:
+-    inc useCount[bestId]
+-  bestId
++    if id >= 0 and id < useCount.len and useCount[id] < PARENT_MAX_USES:
++      eligible.add(id)
++  if eligible.len == 0: return -1
++  result = selectParentId(caseScores, eligible, randomRate)
++  if result >= 0: inc useCount[result]
++
++proc selectBreedingParent(caseScores: seq[seq[float]],
++    preferred, broad: seq[int], useCount: var seq[int],
++    randomRate: float, capacityFallbacks: var int): int =
++  result = selectParentCapped(caseScores, preferred, useCount, randomRate)
++  if result >= 0: return
++  result = selectParentCapped(caseScores, broad, useCount, randomRate)
++  if result >= 0: return
++  # Only a globally exhausted population can exceed the ordinary cap.
++  # Balance this unavoidable capacity fallback and randomize ties.
++  var least = high(int)
++  var tied: seq[int] = @[]
++  for id in broad:
++    if id < 0 or id >= useCount.len: continue
++    if useCount[id] < least:
++      least = useCount[id]
++      tied.setLen(0)
++    if useCount[id] == least: tied.add(id)
++  if tied.len == 0: return -1
++  result = tied[rand(tied.len - 1)]
++  inc useCount[result]
++  inc capacityFallbacks
++
+ 
+ proc releaseParentUse(useCount: var seq[int], id: int) {.inline.} =
+   if id >= 0 and id < useCount.len and useCount[id] > 0: dec useCount[id]
+@@ -5285,6 +5380,24 @@
+     if not duplicate:
+       buckets.mgetOrPut(fp, @[]).add(id)
+       result.add(id)
++
++proc exactOffspringDuplicate(g: Genome, fp: Hash, population: seq[Genome],
++    buckets: Table[Hash, seq[int]]): bool =
++  for id in buckets.getOrDefault(fp):
++    if sameGenomeContent(g, population[id]): return true
++  false
++
++proc rescueDuplicateOffspring(g: var Genome, population: seq[Genome],
++    buckets: Table[Hash, seq[int]], rescued, unresolved: var int): Hash =
++  result = genomeFingerprint(g)
++  if not exactOffspringDuplicate(g, result, population, buckets): return
++  inc rescued
++  for attempt in 0..<2:
++    diversifyExactCopy(g)
++    result = genomeFingerprint(g)
++    if not exactOffspringDuplicate(g, result, population, buckets): return
++  inc unresolved # bounded work even if a pathological duplicate remains
++
+ 
+ proc fusionSnapshot(g: Genome, q: float, generation: int): FusionMember =
+   result.genome = cloneGenome(g)
+@@ -6199,8 +6312,8 @@
+       else:
+         echo "[checkpoint] backup is also invalid: " & e.msg
+ 
+-  # 両方とも壊れている場合は、新規開始へ移行する。
+-  # ここで例外を上へ投げないので、放置運転がcheckpoint破損一発で終了しない。
++  # Clear partial state and report failure. Explicit --load must stop rather
++  # than silently replacing an unreadable checkpoint with a fresh population.
+   population = @[]
+   eliteOfElites = @[]
+   resetFusion()
+@@ -6745,6 +6858,91 @@
+       alternative = alphabet[(rand(alphabet.len - 2) + 1) mod alphabet.len]
+     result[pos] = alternative
+ 
++type EnergyModelData = tuple[genome: Genome, alphabet, frequencies: seq[int], grams: seq[GenerationGram]]
++
++proc readEnergyModelBody(stream: Stream, header: string): EnergyModelData =
++  if header notin [ENERGY_MODEL_MAGIC, ENERGY_MODEL_MAGIC_V9, ENERGY_MODEL_MAGIC_V8,
++      ENERGY_MODEL_MAGIC_V7, ENERGY_MODEL_MAGIC_V6, ENERGY_MODEL_MAGIC_V5,
++      ENERGY_MODEL_MAGIC_V4, ENERGY_MODEL_MAGIC_V3, ENERGY_MODEL_MAGIC_V2, ENERGY_MODEL_MAGIC_V1]:
++    raise newException(IOError, "Expected a V1..V10 .model file, not a GA checkpoint.")
++  let modelVersion =
++    if header == ENERGY_MODEL_MAGIC: CHECKPOINT_VERSION
++    elif header == ENERGY_MODEL_MAGIC_V9: 24
++    elif header == ENERGY_MODEL_MAGIC_V8: 22
++    elif header == ENERGY_MODEL_MAGIC_V7: 21
++    elif header == ENERGY_MODEL_MAGIC_V6: 19
++    elif header == ENERGY_MODEL_MAGIC_V5: 18
++    elif header == ENERGY_MODEL_MAGIC_V4: 17
++    elif header == ENERGY_MODEL_MAGIC_V3: 15
++    else: 14
++  let bodyStart = stream.getPosition()
++  let genomeLength = stream.readInt64()
++  if genomeLength < 1 or genomeLength > 100000:
++    raise newException(IOError, "Invalid energy model genome length.")
++  stream.setPosition(bodyStart)
++  result.genome = readGenome(stream, modelVersion)
++  result.alphabet = readIntSeq(stream)
++  if header != ENERGY_MODEL_MAGIC_V1:
++    result.frequencies = readIntSeq(stream)
++    let gramCount = stream.readInt64()
++    if gramCount < 0 or gramCount > 1024:
++      raise newException(IOError, "Invalid generation gram count.")
++    for i in 0..<int(gramCount):
++      let tokens = readIntSeq(stream)
++      let frequency = stream.readInt64()
++      if tokens.len < 2 or tokens.len > 8 or frequency < 1 or frequency > 1_000_000_000:
++        raise newException(IOError, "Invalid generation n-gram.")
++      result.grams.add(GenerationGram(tokens: tokens, frequency: int(frequency)))
++  else:
++    result.frequencies = newSeq[int](result.alphabet.len)
++    result.frequencies.fill(1)
++  if not stream.atEnd(): raise newException(IOError, "Trailing energy model data.")
++  if result.genome.len < 1 or result.genome.len > 100000 or
++      result.alphabet.len == 0 or result.alphabet.len > 4096 or
++      result.frequencies.len != result.alphabet.len:
++    raise newException(IOError, "Invalid energy model.")
++  for r in result.genome:
++    if r.weight != r.weight or abs(r.weight) > 1.0e6:
++      raise newException(IOError, "Invalid model weights.")
++  var allowed = initHashSet[int]()
++  for i, v in result.alphabet:
++    if v < 0 or v > 0x10FFFF or (v >= 0xD800 and v <= 0xDFFF) or
++        result.frequencies[i] <= 0 or result.frequencies[i] > 1_000_000_000 or v in allowed:
++      raise newException(IOError, "Invalid model Unicode alphabet/frequencies.")
++    allowed.incl(v)
++  for gram in result.grams:
++    for token in gram.tokens:
++      if token notin allowed: raise newException(IOError, "Generation n-gram not in alphabet.")
++
++proc readEnergyModel(stream: Stream): EnergyModelData =
++  let prefix = stream.readStr(ENERGY_MODEL_MAGIC_V9.len)
++  if prefix == ENERGY_MODEL_MAGIC_V1:
++    let bodyStart = stream.getPosition()
++    if stream.readStr(1) == "0":
++      # A V1 genome length whose low byte is 48 also begins with ASCII '0'.
++      # Accept V10 only after its complete body, mapping and alphabet validate.
++      try:
++        return readEnergyModelBody(stream, ENERGY_MODEL_MAGIC)
++      except IOError:
++        discard
++    stream.setPosition(bodyStart)
++  readEnergyModelBody(stream, prefix)
++
++proc resolveCheckpointPaths(args: seq[string]): tuple[loadRequested: bool, loadPath, savePath: string] =
++  result.loadPath = "ga_checkpoint.bin"
++  var explicitSave = false
++  for arg in args:
++    if arg == "--load": result.loadRequested = true
++    elif arg.startsWith("--load="):
++      result.loadRequested = true
++      result.loadPath = arg.split("=", 1)[1]
++    elif arg.startsWith("--save="):
++      explicitSave = true
++      result.savePath = arg.split("=", 1)[1]
++  if not explicitSave: result.savePath = result.loadPath
++  if result.loadPath.len == 0 or result.savePath.len == 0:
++    raise newException(ValueError, "Checkpoint paths must not be empty.")
++
+ proc optimizeText(
+     modelPath, prompt, outputPath: string,
+     count, steps, seed, requestedPopulation: int) =
+@@ -6762,65 +6960,18 @@
+   var frequencies: seq[int]
+   var grams: seq[GenerationGram] = @[]
+   try:
+-    # V10 adds one header byte; inspect the fixed V1..V9 prefix first so
+-    # legacy models do not consume the first byte of the genome length.
+-    let prefix = stream.readStr(ENERGY_MODEL_MAGIC_V9.len)
+-    let header = if prefix == ENERGY_MODEL_MAGIC[0 ..< ENERGY_MODEL_MAGIC_V9.len]:
+-                   prefix & stream.readStr(1)
+-                 else: prefix
+-    if header notin [ENERGY_MODEL_MAGIC, ENERGY_MODEL_MAGIC_V9, ENERGY_MODEL_MAGIC_V8, ENERGY_MODEL_MAGIC_V7,
+-                     ENERGY_MODEL_MAGIC_V6, ENERGY_MODEL_MAGIC_V5, ENERGY_MODEL_MAGIC_V4,
+-                     ENERGY_MODEL_MAGIC_V3, ENERGY_MODEL_MAGIC_V2, ENERGY_MODEL_MAGIC_V1]:
+-      quit("Expected a V1..V10 .model file, not a GA checkpoint.")
+-    let modelVersion =
+-      if header == ENERGY_MODEL_MAGIC: CHECKPOINT_VERSION
+-      elif header == ENERGY_MODEL_MAGIC_V9: 24
+-      elif header == ENERGY_MODEL_MAGIC_V8: 22
+-      elif header == ENERGY_MODEL_MAGIC_V7: 21
+-      elif header == ENERGY_MODEL_MAGIC_V6: 19
+-      elif header == ENERGY_MODEL_MAGIC_V5: 18
+-      elif header == ENERGY_MODEL_MAGIC_V4: 17
+-      elif header == ENERGY_MODEL_MAGIC_V3: 15
+-      else: 14
+-    genome = readGenome(stream, modelVersion)
+-    alphabet = readIntSeq(stream)
+-    if header != ENERGY_MODEL_MAGIC_V1:
+-      frequencies = readIntSeq(stream)
+-      let gramCount = stream.readInt64()
+-      if gramCount < 0 or gramCount > 1024:
+-        quit("Invalid generation gram count.")
+-      for _ in 0 ..< int(gramCount):
+-        let tokens = readIntSeq(stream)
+-        let frequency = stream.readInt64()
+-        if tokens.len < 2 or tokens.len > 8 or frequency < 1 or
+-            frequency > 1_000_000_000:
+-          quit("Invalid generation n-gram.")
+-        grams.add(GenerationGram(tokens: tokens, frequency: int(frequency)))
+-    else:
+-      frequencies = newSeq[int](alphabet.len)
+-      for i in 0 ..< alphabet.len: frequencies[i] = 1
+-    if not stream.atEnd(): quit("Trailing energy model data.")
++    let loaded = readEnergyModel(stream)
++    genome = loaded.genome
++    alphabet = loaded.alphabet
++    frequencies = loaded.frequencies
++    grams = loaded.grams
+   finally:
+     stream.close()
+-  if genome.len < 1 or genome.len > 100000 or alphabet.len == 0 or
+-      alphabet.len > 4096 or frequencies.len != alphabet.len:
+-    quit("Invalid energy model.")
+-  for r in genome:
+-    if r.weight != r.weight or abs(r.weight) > 1.0e6:
+-      quit("Invalid model weights.")
+-  var allowed = initHashSet[int]()
+   var cumulative = newSeq[float](alphabet.len)
+   var total = 0.0
+-  for i, v in alphabet:
+-    if v < 0 or v > 0x10FFFF or (v >= 0xD800 and v <= 0xDFFF) or
+-        frequencies[i] <= 0 or frequencies[i] > 1_000_000_000 or v in allowed:
+-      quit("Invalid model Unicode alphabet/frequencies.")
+-    allowed.incl(v)
+-    total += sqrt(float(frequencies[i]))
++  for i, frequency in frequencies:
++    total += sqrt(float(frequency))
+     cumulative[i] = total
+-  for gram in grams:
+-    for v in gram.tokens:
+-      if v notin allowed: quit("Generation n-gram not in alphabet.")
+   var compiled = newSeq[SeqPattern](genome.len)
+   for i, rule in genome: compiled[i] = compileSeqPattern(rule.a)
+   let candidates = buildCandidateIndex(compiled)
+@@ -7577,6 +7728,620 @@
+ if generatePath.len > 0:
+   optimizeText(generatePath, generatePrompt, generateOutput,
+                generateLength, generateSteps, generateSeed, generatePopulation)
++  quit(0)
++
++if "--bottleneck-test" in commandLineParams():
++  proc twoPointGenomeCrossoverReference(base, donor: Genome, l, r: int): Genome =
++    ## Exact [0,l) from base + [l,r) from donor + [r,n) from base.
++    result = cloneGenome(base)
++    let n = min(base.len, donor.len)
++    if l < 0 or r > n or l >= r: return
++    for i in l ..< r:
++      if compatibleRule(donor[i]):
++        result[i] = transplantRule(donor[i], donor[0].embedding, base[0].embedding)
++    result[0].embedding = base[0].embedding
++    for i in 1 ..< result.len: result[i].embedding = @[]
++  
++  proc crossoverGenomeReference(
++    p1, p2: Genome, op: CrossoverOp,
++    t1, t2: RuleTrace
++  ): Genome =
++    let n = min(p1.len, p2.len)
++    result = cloneGenome(p1)
++    if n == 0: return
++    if p1[0].embedding != p2[0].embedding and
++        op in {coHomologous, coModule}:
++      # Trace hashes and structural homology are coordinate-system dependent.
++      # Cross-map transfer stays valid via mapping-aware two-point transplant.
++      let (l, r) = sampleCrossoverSegment(n)
++      result = twoPointGenomeCrossoverReference(p1, p2, l, r)
++      return
++    case op
++    of coTwoPoint:
++      let (l, r) = sampleCrossoverSegment(n)
++      result = twoPointGenomeCrossoverReference(p1, p2, l, r)
++    of coHomologous:
++      let matched = alignOrderedRules(p1, p2, t1, t2)
++      if matched.len == 0:
++        # Homology unavailable: use an ordinary sequence crossover, not a no-op.
++        let (l, r) = sampleCrossoverSegment(n)
++        result = twoPointGenomeCrossoverReference(p1, p2, l, r)
++      else:
++        let count = sampleCrossoverLength(matched.len)
++        let start = rand(matched.len - count)
++        for mi in start ..< start + count:
++          let a = matched[mi].base
++          let b = matched[mi].donor
++          if sameRule(p1[a], p2[b]) and rand(99) < 70:
++            # Exact structural homology permits independent bit recombination.
++            result[a] = recombineHomologousRule(p1[a], p2[b])
++          else:
++            # Different a/b: inherit the entire donor rule.
++            if compatibleRule(p2[b]):
++              result[a] = transplantRule(p2[b], p2[0].embedding, p1[0].embedding)
++    of coModule:
++      # Favor active source interfaces; do not assume index == function.
++      var active: seq[int] = @[]
++      for i in 0 ..< min(n, t2.len):
++        if t2[i].hits > 0: active.add(i)
++      # Prefer a champion-derived contiguous functional module when the same
++      # a/b signature is present in this donor at its recorded source site.
++      # Otherwise use a trace-active source and full-range log-uniform length.
++      var guidedSources: seq[int] = @[]
++      if guidedModules.len > 0 and guidedReferenceGenome.len > 0 and
++          p1[0].embedding == p2[0].embedding and
++          p2[0].embedding == guidedReferenceGenome[0].embedding:
++        for mi, m in guidedModules:
++          if m.rules.len < 1 or m.startPos < 0 or
++             m.startPos + m.rules.len > n: continue
++          var valid = true
++          for j in 0 ..< m.rules.len:
++            let donorRule = p2[m.startPos + j]
++            if not sameRule(donorRule, m.rules[j]):
++              valid = false
++              break
++          if valid: guidedSources.add(mi)
++      var length = sampleCrossoverLength(n)
++      var src = rand(n - length)
++      if guidedSources.len > 0 and rand(99) < 40:
++        let m = guidedModules[guidedSources[rand(guidedSources.len - 1)]]
++        length = m.rules.len
++        src = m.startPos
++      elif active.len > 0 and rand(99) < 75:
++        let anchor = active[rand(active.len - 1)]
++        src = max(0, min(n - length, anchor - rand(length - 1)))
++      var bestDst = src
++      var bestFit = moduleInterfaceFitness(p1, p2, t1, t2,
++        src, src, length)
++      # Search nearby, aligned and exploratory slots. Never rotate or resize the
++      # donor block; ordered internal dependencies and genome length are retained.
++      for trial in 0 ..< 12:
++        let dst = if trial < 8:
++          max(0, min(n - length, src + rand(128) - 64))
++        else:
++          rand(n - length)
++        let fit = moduleInterfaceFitness(p1, p2, t1, t2,
++          dst, src, length)
++        if fit > bestFit:
++          bestFit = fit
++          bestDst = dst
++      for j in 0 ..< length:
++        if compatibleRule(p2[src + j]):
++          result[bestDst + j] = transplantRule(p2[src + j], p2[0].embedding, p1[0].embedding)
++    of coMacro:
++      # Non-homologous, full-range exploration: a single log-uniform block.
++      let length = sampleCrossoverLength(n)
++      let src = rand(n - length)
++      let dst = if rand(99) < 85: src else: rand(n - length)
++      let reversed = rand(99) < 2
++      for j in 0 ..< length:
++        let donorIdx = if reversed: src + length - j - 1 else: src + j
++        if compatibleRule(p2[donorIdx]):
++          result[dst + j] = transplantRule(p2[donorIdx], p2[0].embedding, p1[0].embedding)
++    # The mapping is a separate allele; row-0 replacement must not overwrite it.
++    result[0].embedding = p1[0].embedding
++    for i in 1 ..< result.len: result[i].embedding = @[]
++
++  proc pairHeadGetReference(h: PairHeadIndex, key: int): int32 {.inline.} =
++    if h.keys.len == 0: return 0'i32
++    var slot = pairHeadSlot(h,key)
++    while true:
++      let stored=h.keys[slot]
++      if stored == -1'i32: return 0'i32
++      if stored == int32(key): return h.heads[slot]
++      slot=(slot+1) and h.mask
++
++  proc scanCandidateIdsReference(
++    index: CandidateIndex,
++    text: openArray[int],
++    outIds: var seq[int],
++    scratch: var CandidateScratch,
++    minRuleIndex: int = 0
++  ) {.gcsafe.} =
++    ## 先頭1/2要素の候補を抽出するhot path。
++    ## 直前要素をprevとして保持し、text[i] と text[i+1] の二重ロードを避ける。
++    outIds.setLen(0)
++    # Pair deduplication is per scan. Clear only 64-bit words that were touched
++    # last time; never memset the full 513^2 bit domain and never hash pairs.
++    for rawWord in scratch.pairTouchedWords:
++      scratch.pairSeenBits[int(rawWord)] = 0'u64
++    scratch.pairTouchedWords.setLen(0)
++    if scratch.stamp == high(int32):
++      scratch.ruleSeen.fill(0)
++      scratch.byteSeen.fill(0)
++      scratch.stamp = 0
++    inc scratch.stamp
++  
++    for pid in index.alwaysCandidates:
++      markCandidate(pid.int, minRuleIndex, outIds, scratch)
++  
++    if outIds.len >= index.candidateRuleCount - minRuleIndex:
++      scratch.candidateValid = true
++      return
++  
++    let n = text.len
++    if n == 0:
++      scratch.candidateValid = true
++      return
++  
++    var i = 0
++    var prev = text[0]
++    while true:
++      if prev >= 0 and prev <= EMBEDDING_OOV and index.head1[prev] != 0 and
++         scratch.byteSeen[prev] != scratch.stamp:
++        scratch.byteSeen[prev] = scratch.stamp
++        var p = index.head1[prev]
++        while p != 0:
++          let pid = (p - 1).int
++          # Buckets are built by ascending pid and linked at the head, so the
++          # chain is strictly descending. Earlier rows cannot be eligible.
++          if pid < minRuleIndex: break
++          markCandidate(pid, minRuleIndex, outIds, scratch)
++          if outIds.len >= index.candidateRuleCount - minRuleIndex:
++            scratch.candidateValid = true
++            return
++          p = index.next1[pid]
++  
++      inc i
++      if i >= n:
++        break
++  
++      let curr = text[i]
++      if prev >= 0 and prev <= EMBEDDING_OOV and curr >= 0 and curr <= EMBEDDING_OOV:
++        let key = pairKey(prev, curr)
++        let head = if index.densePairHeads.len > 0: index.densePairHeads[key]
++                   else: pairHeadGetReference(index.head2, key)
++        if head != 0:
++          let word = key shr 6
++          let bit = 1'u64 shl (key and 63)
++          if (scratch.pairSeenBits[word] and bit) != 0'u64:
++            prev = curr
++            continue
++          if scratch.pairSeenBits[word] == 0'u64:
++            scratch.pairTouchedWords.add(int32(word))
++          scratch.pairSeenBits[word] = scratch.pairSeenBits[word] or bit
++          var q = head
++          while q != 0:
++            let pid = (q - 1).int
++            if pid < minRuleIndex: break
++            markCandidate(pid, minRuleIndex, outIds, scratch)
++            if outIds.len >= index.candidateRuleCount - minRuleIndex:
++              scratch.candidateValid = true
++              return
++            q = index.next2[pid]
++  
++      prev = curr
++  
++    scratch.candidateValid = true
++  
++  proc scoreRawReference(
++    genome: Genome,
++    compiled: seq[SeqPattern],
++    candidates: CandidateIndex,
++    input: seq[int],
++    evalScratch: var EvalScratch,
++    maxRounds: int = SCORE_ROUNDS,
++    recordCredit: bool = false,
++    overflowed: ptr bool = nil,
++    featureCoefficients: ptr seq[float] = nil,
++    maxRuleVisits: int = EVAL_MAX_RULE_VISITS,
++    maxSampleSeconds: float = EVAL_MAX_SAMPLE_SECONDS,
++    clockCheckVisits: int = EVAL_CLOCK_CHECK_VISITS
++  ): float {.gcsafe.} =
++    ## One text, sequential rules, no parallel state or original-worldline.
++    ## Each successful match earns its signed rule weight even if unchanged.
++    ## An overlong replacement penalizes the sample by 1 and terminates it.
++    ## Repeated adjacent pairs of round scores discard the duplicate round,
++    ## including its features and credit (same policy as the old evaluator).
++    if overflowed != nil: overflowed[] = false
++    if featureCoefficients != nil:
++      featureCoefficients[].setLen(genome.len)
++      featureCoefficients[].fill(0.0)
++    if maxRounds <= 0 or input.len == 0 or genome.len == 0: return 0.0
++    let embedded = genome[0].embedding.len == EMBEDDING_ENTRY_COUNT
++    let encodedLen = if embedded: input.len * EMBEDDING_WIDTH else: input.len
++    let maxAggLen = min(32768,
++      max(1500 * (if embedded: EMBEDDING_WIDTH else: 1), encodedLen * 32))
++    # Maintain the original compute budget rather than doubling sqrt(N) rounds
++    # merely because an external byte is represented by three digits.
++    let rounds = min(maxRounds, max(1, int(ceil(2 * sqrt(float(input.len))))))
++    # Reuse the per-worker input buffer. A fresh clone allocated and zero-filled
++    # one seq for EVERY observation, even if no rule ever matched. move/defer
++    # preserve distinct input/output buffers and restore ownership on exceptions.
++    var state = move(evalScratch.bufA)
++    if embedded:
++      embedBytesInto(input, genome[0].embedding, state)
++    else:
++      state.setLen(input.len)
++      copyMem(addr state[0], unsafeAddr input[0], input.len * sizeof(int))
++    defer: evalScratch.bufA = move(state)
++    var budget = EvaluationBudget(
++      started: epochTime(),
++      maxRuleVisits: max(1, maxRuleVisits),
++      maxSampleSeconds: maxSampleSeconds,
++      clockCheckVisits: max(1, clockCheckVisits)
++    )
++    let needFeatures = recordCredit or featureCoefficients != nil
++    var roundFeatures: seq[float] = @[]
++    if needFeatures: roundFeatures = newSeq[float](genome.len)
++    evalScratch.seenAttPairs.setLen(0)
++    var previousAtt = 0.0
++    var havePreviousAtt = false
++    for roundIdx in 0 ..< rounds:
++      discard roundIdx
++      var roundScore = 0.0
++      var rewrote = false
++      var terminated = false
++      var candidateValid = false
++      if needFeatures: roundFeatures.fill(0.0)
++      var k = 0
++      var candidateCursor = 0
++      var sparseCandidates = false
++      while k < genome.len:
++        if not candidateValid:
++          scanCandidateIdsReference(candidates, state, evalScratch.candidateIds,
++            evalScratch.candidateScratch, k)
++          candidateValid = true
++          # Sorting a short list pays off by avoiding thousands of missed rows.
++          # A dense candidate set instead keeps the original O(N) bitmap walk.
++          # No possible anchor means no rule can match in the remainder of this
++          # ordered sweep. Stop immediately; the outer `not rewrote` guard then
++          # terminates the temporal loop as well.
++          if evalScratch.candidateIds.len == 0:
++            advanceEvaluationBudget(budget, genome.len - k)
++            break
++          sparseCandidates = evalScratch.candidateIds.len * 3 < genome.len
++          if sparseCandidates:
++            evalScratch.candidateIds.sort()
++            candidateCursor = 0
++        if sparseCandidates:
++          while candidateCursor < evalScratch.candidateIds.len and
++                evalScratch.candidateIds[candidateCursor] < k:
++            inc candidateCursor
++          if candidateCursor == evalScratch.candidateIds.len:
++            advanceEvaluationBudget(budget, genome.len - k)
++            break
++          let candidateK = evalScratch.candidateIds[candidateCursor]
++          advanceEvaluationBudget(budget, candidateK - k)
++          k = candidateK
++          inc candidateCursor
++        checkEvaluationBudget(budget)
++        if not sparseCandidates and
++            evalScratch.candidateScratch.ruleSeen[k] != evalScratch.candidateScratch.stamp:
++          inc k
++          continue
++        var replacementOverflow = false
++        var matched = false
++        try:
++          matched = replaceSeqCompiledInto(state, compiled[k], genome[k].b,
++            evalScratch.bufB, evalScratch.replaceScratch,
++            addr evalScratch.replacementPlans[k],
++            addr replacementOverflow, maxAggLen,
++            genome[k].replacementRevision,
++            addr evalScratch.replacementPlanRevision[k])
++        except Defect as e:
++          raise newException(SeqReplaceError,
++            "replacement crashed: rule=" & $k & " state.len=" & $state.len &
++            " output.len=" & $evalScratch.bufB.len &
++            " maxOutput=" & $maxAggLen & " pattern=" & $genome[k].a &
++            " replacement=" & $genome[k].b & "\n" & e.msg &
++            "\n" & getStackTrace(e))
++        if replacementOverflow:
++          roundScore -= 1.0
++          if overflowed != nil: overflowed[] = true
++          terminated = true
++          break
++        if not matched:
++          inc k
++          continue
++        rewrote = true
++        roundScore += genome[k].weight
++        if needFeatures: roundFeatures[k] += 1.0
++        if evalScratch.bufB != state:
++          swap(state, evalScratch.bufB)
++          candidateValid = false
++        inc k
++      if roundScore != roundScore or abs(roundScore) == Inf:
++        raise newException(EvaluationBudgetExceeded,
++          "non-finite accumulated round score")
++      if havePreviousAtt:
++        if seenAttPairContains(evalScratch, previousAtt, roundScore):
++          break
++        rememberAttPair(evalScratch, previousAtt, roundScore)
++      previousAtt = roundScore
++      havePreviousAtt = true
++      result += roundScore
++      if result != result or abs(result) == Inf:
++        raise newException(EvaluationBudgetExceeded,
++          "non-finite accumulated temporal score")
++      if needFeatures:
++        for k, coeff in roundFeatures:
++          if coeff == 0.0: continue
++          if featureCoefficients != nil:
++            featureCoefficients[][k] += coeff
++          if recordCredit:
++            if evalScratch.creditStamp[k] != evalScratch.creditEpoch:
++              evalScratch.creditStamp[k] = evalScratch.creditEpoch
++              evalScratch.creditTouched.add(k)
++            evalScratch.creditContrib[k] += coeff * genome[k].weight
++      # Critical fixed-point cutoff: zero successful replacements in a round means
++      # every later round would see the identical state and can do no new work.
++      if terminated or not rewrote: break
++  
++  proc selectParentCappedReference(
++    caseScores: seq[seq[float]],
++    candidateIds: openArray[int],
++    useCount: var seq[int],
++    randomRate: float
++  ): int {.inline.} =
++    ## 同じ親が世代内に過剰繁殖しないよう、まず通常選択し、
++    ## 上限へ到達した個体は数回だけ引き直す。全員が上限なら
++    ## 最小使用回数の親へフォールバックする。
++    if candidateIds.len == 0:
++      return -1
++    for _ in 0 ..< 6:
++      let id = selectParentId(caseScores, candidateIds, randomRate)
++      if id < 0:
++        return -1
++      if id >= useCount.len or useCount[id] < PARENT_MAX_USES:
++        if id >= 0 and id < useCount.len:
++          inc useCount[id]
++        return id
++    var bestId = candidateIds[0]
++    var bestUses = if bestId < useCount.len: useCount[bestId] else: 0
++    for id in candidateIds:
++      let u = if id < useCount.len: useCount[id] else: 0
++      if u < bestUses:
++        bestUses = u
++        bestId = id
++    if bestId >= 0 and bestId < useCount.len:
++      inc useCount[bestId]
++    bestId
++
++  randomize(61347)
++  buildCorpusByteStats(@[@[32, 65, 66, 67, 97, 98, 99]])
++  var pop: seq[Genome] = @[]
++  for id in 0..<128:
++    var g: Genome = @[]
++    for i in 0..<64:
++      g.add(Rule(a: @[rand(255), rand(255)], b: @[rand(255)],
++        weight: rand(2.0)-1.0, patternRevision:freshPatternRevision(),
++        replacementRevision:freshReplacementRevision()))
++    g[0].embedding = defaultEmbedding()
++    if id mod 2 == 1: swap(g[0].embedding[65],g[0].embedding[66])
++    pop.add(g)
++  # Identical greedy survivor sequence, including deterministic tie order.
++  var oldComparisons = 0
++  var scratch = newMinDistanceScratch(pop.len)
++  var selectedOld = @[0,1,2,3]
++  var selectedNew = selectedOld
++  for step in 0..<24:
++    var bestOld = -1
++    var bestNew = -1
++    var maxOld = -Inf
++    var maxNew = -Inf
++    for id in 0..<pop.len:
++      if id in selectedOld: continue
++      var distance = Inf
++      for sid in selectedOld:
++        distance = min(distance,localGenomeDistance(pop[id],pop[sid]))
++        inc oldComparisons
++      let cached = minimumSelectedDistance(pop,id,selectedNew,scratch)
++      doAssert cached == distance
++      if distance > maxOld:
++        maxOld=distance
++        bestOld=id
++      if cached > maxNew:
++        maxNew=cached
++        bestNew=id
++    doAssert bestNew == bestOld
++    selectedOld.add(bestOld)
++    selectedNew.add(bestNew)
++  echo "PASS: incremental distance gives identical selected IDs; comparisons ",oldComparisons," -> ",scratch.comparisons
++  for ruleCount in [1, 48, 304]:
++    let oldModel = newStringStream()
++    oldModel.write(ENERGY_MODEL_MAGIC_V1)
++    oldModel.write(ruleCount.int64)
++    for i in 0..<ruleCount:
++      writeIntSeq(oldModel, if i == 0 and ruleCount == 304: @[] else: @[65])
++      writeIntSeq(oldModel, @[66])
++      oldModel.write(1.0)
++      oldModel.write(0.0) # v14 reserved allele
++    writeIntSeq(oldModel, @[65,66])
++    oldModel.setPosition(0)
++    let restored = readEnergyModel(oldModel)
++    doAssert restored.genome.len == ruleCount and restored.alphabet == @[65,66]
++    doAssert restored.frequencies == @[1,1]
++    oldModel.close()
++  let newModel = newStringStream()
++  newModel.write(ENERGY_MODEL_MAGIC)
++  writeGenome(newModel,pop[0])
++  writeIntSeq(newModel,@[65,66])
++  writeIntSeq(newModel,@[1,2])
++  newModel.write(0'i64)
++  newModel.setPosition(0)
++  doAssert sameGenomeContent(readEnergyModel(newModel).genome,pop[0])
++  newModel.close()
++  for args in [@["--load=old.bin","--save=new.bin"],@["--save=new.bin","--load=old.bin"]]:
++    let paths=resolveCheckpointPaths(args)
++    doAssert paths.loadRequested and paths.loadPath=="old.bin" and paths.savePath=="new.bin"
++  doAssert resolveCheckpointPaths(@["--load=old.bin"]).savePath=="old.bin"
++  echo "PASS: V1 headers (including ambiguous 48/304 rules), V10 model roundtrip, order-independent load/save"
++
++  var base=cloneGenome(pop[0])
++  var donor=cloneGenome(pop[1])
++  let parentSnapshot=cloneGenome(base)
++  let donorSnapshot=cloneGenome(donor)
++  let expected=cloneGenome(base)
++  var reference=cloneGenome(expected)
++  for i in 0..<reference.len:
++    reference[i]=transplantRule(donor[i],donor[0].embedding,base[0].embedding)
++  reference[0].embedding=base[0].embedding
++  let transferred=twoPointGenomeCrossover(base,donor,0,base.len)
++  doAssert sameGenomeContent(reference,transferred)
++  doAssert sameGenomeContent(parentSnapshot,base) and sameGenomeContent(donorSnapshot,donor)
++  echo "PASS: planned cross-map block transfer equals per-row translation; parents unchanged"
++  for op in CrossoverOp:
++    for seed in 0..<24:
++      let aId=seed mod 8
++      let bId=(seed+1+(seed mod 2)) mod 8
++      let beforeA=genomeFingerprint(pop[aId])
++      let beforeB=genomeFingerprint(pop[bId])
++      randomize(seed)
++      let expected=crossoverGenomeReference(pop[aId],pop[bId],op,@[],@[])
++      randomize(seed)
++      var actual=crossoverGenome(pop[aId],pop[bId],op,@[],@[])
++      doAssert sameGenomeContent(expected,actual)
++      mutateGenome(actual,1.7,20)
++      doAssert genomeFingerprint(pop[aId])==beforeA and genomeFingerprint(pop[bId])==beforeB
++  echo "PASS: all four crossover operators match prior content under identical seeds; mutation preserves parents"
++
++  var scores=newSeq[seq[float]](64)
++  var allIds:seq[int] = @[]
++  for id in 0..<scores.len:
++    scores[id] = @[0.5,0.5,0.5]
++    allIds.add(id)
++  var oldUses=newSeq[int](scores.len)
++  var newUses=newSeq[int](scores.len)
++  var fallbacks=0
++  for draw in 0..<512:
++    discard selectParentCappedReference(scores,@[0],oldUses,0.035)
++    discard selectBreedingParent(scores,@[0],allIds,newUses,0.035,fallbacks)
++  doAssert oldUses[0] == 512
++  doAssert newUses.max <= PARENT_MAX_USES and fallbacks == 0
++  doAssert selectParentCapped(scores,@[0],newUses,0.035) == -1
++  let totalUses=newUses.foldl(a+b,0)
++  doAssert totalUses == 512
++  echo "PASS: narrow-pool saturation broadens to FULL pool; max uses ",oldUses.max," -> ",newUses.max
++
++  var unchanged=0
++  for trial in 0..<512:
++    var child=cloneGenome(pop[0])
++    mutateGenome(child,0.35,0)
++    if sameGenomeContent(child,pop[0]): inc unchanged
++  echo "mutation_baseline no_change=",unchanged,"/512 scale=0.35"
++  var buckets=initTable[Hash,seq[int]]()
++  buckets[genomeFingerprint(pop[0])] = @[0]
++  var rescued,unresolved:int
++  let snapshot=cloneGenome(pop[0])
++  for trial in 0..<128:
++    var child=cloneGenome(pop[0])
++    let fp=rescueDuplicateOffspring(child,pop,buckets,rescued,unresolved)
++    doAssert not sameGenomeContent(child,pop[0])
++    doAssert not exactOffspringDuplicate(child,fp,pop,buckets)
++    doAssert sameGenomeContent(pop[0],snapshot)
++  doAssert rescued==128 and unresolved==0
++  buckets[genomeFingerprint(pop[1])] = @[0] # deliberately injected hash collision
++  doAssert not exactOffspringDuplicate(pop[1],genomeFingerprint(pop[1]),pop,buckets)
++  for weight in [0.0, WEIGHT_ABS_LIMIT, -WEIGHT_ABS_LIMIT, WEIGHT_SIGN_FLOOR]:
++    var boundary:Genome = @[Rule(a: @[65], b: @[66], weight:weight)]
++    diversifyExactCopy(boundary)
++    doAssert boundary[0].weight != weight and abs(boundary[0].weight)<=WEIGHT_ABS_LIMIT
++    if weight != 0: doAssert weight*boundary[0].weight>0
++  echo "PASS: duplicate rescue changes real weights, preserves parents/signs, handles hash collision"
++
++  var g=cloneGenome(pop[0])
++  for i in g.len..<1500:
++    g.add(Rule(a: @[rand(255),rand(255)], b: @[rand(255)], weight:rand(2.0)-1.0,
++      patternRevision:freshPatternRevision(),replacementRevision:freshReplacementRevision()))
++  var compiled:seq[SeqPattern] = @[]
++  for r in g: compiled.add(compileSeqPattern(r.a))
++  let sparse=buildCandidateIndex(compiled)
++  let dense=generationCandidateIndex(sparse)
++  var grown=buildCandidateIndex(@[compiled[0]])
++  rebuildCandidateIndex(grown,compiled)
++  doAssert grown.head2.count==sparse.head2.count
++  for key in 0..<INDEX_TOKEN_COUNT*INDEX_TOKEN_COUNT:
++    doAssert pairHeadGet(grown.head2,key)==pairHeadGet(sparse.head2,key)
++  rebuildCandidateIndex(grown,@[compiled[0]])
++  let one=buildCandidateIndex(@[compiled[0]])
++  for key in 0..<INDEX_TOKEN_COUNT*INDEX_TOKEN_COUNT:
++    doAssert pairHeadGet(grown.head2,key)==pairHeadGet(one.head2,key)
++  echo "PASS: candidate index grows safely and clears removed keys on shrink"
++  var a=newEvalScratch(g.len)
++  var b=newEvalScratch(g.len)
++  var samples:seq[seq[int]] = @[]
++  for trial in 0..<64:
++    var sample:seq[int] = @[]
++    for i in 0..<512:
++      sample.add(if trial mod 2 == 0: rand(255) else: [32,65,66,32,65,66,257,-2][i mod 8])
++    samples.add(sample)
++    for index in [sparse,dense]:
++      for lower in [0,100,1499,1500]:
++        scanCandidateIdsReference(index,sample,a.candidateIds,a.candidateScratch,lower)
++        scanCandidateIds(index,sample,b.candidateIds,b.candidateScratch,lower)
++        doAssert a.candidateIds == b.candidateIds
++      var f1,f2:seq[float] = @[]
++      doAssert scoreRawReference(g,compiled,index,sample,a,4,featureCoefficients=addr f1) ==
++        scoreRaw(g,compiled,index,sample,b,4,featureCoefficients=addr f2)
++      doAssert f1==f2
++  echo "PASS: candidate order and exact scores/features match reference (sparse/dense, repeated/OOV tokens)"
++  for repeated in [false,true]:
++    var oldSeconds,newSeconds:float
++    for turn in 0..<6:
++      for lane in 0..1:
++        let useOld=(turn+lane) mod 2 == 0
++        let start=cpuTime()
++        for i in 0..<2048:
++          let sample=samples[2*(i mod 32)+(if repeated:1 else:0)]
++          if useOld: scanCandidateIdsReference(sparse,sample,a.candidateIds,a.candidateScratch)
++          else: scanCandidateIds(sparse,sample,b.candidateIds,b.candidateScratch)
++        if useOld: oldSeconds+=cpuTime()-start
++        else: newSeconds+=cpuTime()-start
++    echo "scan_benchmark repeated=",repeated," before_s=",oldSeconds," after_s=",newSeconds,
++      " speedup=",oldSeconds/max(1e-9,newSeconds)
++  var oldScoreTime,newScoreTime:float
++  for turn in 0..<4:
++    for lane in 0..1:
++      let useOld=(turn+lane) mod 2 == 0
++      let start=cpuTime()
++      for i in 0..<4096:
++        if useOld: discard scoreRawReference(g,compiled,sparse,samples[i mod 64],a,4)
++        else: discard scoreRaw(g,compiled,sparse,samples[i mod 64],b,4)
++      if useOld: oldScoreTime+=cpuTime()-start
++      else: newScoreTime+=cpuTime()-start
++  echo "score_benchmark before_s=",oldScoreTime," after_s=",newScoreTime,
++    " speedup=",oldScoreTime/max(1e-9,newScoreTime)
++  var oldTransferTime,newTransferTime:float
++  let bigBase=cloneGenome(g)
++  var bigDonor=cloneGenome(g)
++  bigDonor[0].embedding=cloneEmbedding(g[0].embedding)
++  swap(bigDonor[0].embedding[65],bigDonor[0].embedding[66])
++  for turn in 0..<6:
++    for lane in 0..1:
++      let useOld=(turn+lane) mod 2 == 0
++      let start=cpuTime()
++      for repeatId in 0..<32:
++        var child=cloneGenome(bigBase)
++        if useOld:
++          for i in 0..<g.len: child[i]=transplantRule(bigDonor[i],bigDonor[0].embedding,bigBase[0].embedding)
++          child[0].embedding=bigBase[0].embedding
++        else: child=twoPointGenomeCrossover(bigBase,bigDonor,0,g.len)
++        doAssert child.len==1500
++      if useOld:oldTransferTime+=cpuTime()-start
++      else:newTransferTime+=cpuTime()-start
++  echo "transfer_benchmark before_s=",oldTransferTime," after_s=",newTransferTime,
++    " speedup=",oldTransferTime/max(1e-9,newTransferTime)
+   quit(0)
+ 
+ if "--refinement-test" in commandLineParams():
+@@ -8925,21 +9690,11 @@
+ var fastAggsY : seq[seq[int]] = @[]
+ var fastRankedY : seq[seq[float]] = @[]
+ 
+-let CHECKPOINT_DEFAULT = "ga_checkpoint.bin"
+-var checkpointPath = CHECKPOINT_DEFAULT
+-var loadRequested = false
+-var resetEliteArchiveRequested = false
+-
+-for arg in commandLineParams():
+-  if arg == "--load":
+-    loadRequested = true
+-  elif arg.startsWith("--load="):
+-    loadRequested = true
+-    checkpointPath = arg.split("=", 1)[1]
+-  elif arg.startsWith("--save="):
+-    checkpointPath = arg.split("=", 1)[1]
+-  elif arg == "--reset-elite-archive":
+-    resetEliteArchiveRequested = true
++let checkpointArgs = resolveCheckpointPaths(commandLineParams())
++let checkpointPath = checkpointArgs.savePath
++let checkpointLoadPath = checkpointArgs.loadPath
++let loadRequested = checkpointArgs.loadRequested
++let resetEliteArchiveRequested = "--reset-elite-archive" in commandLineParams()
+ 
+ var startIter = 0
+ var loadedCheckpoint = false
+@@ -8953,9 +9708,9 @@
+   except CatchableError:
+     discard
+ 
+-if loadRequested and fileExists(checkpointPath):
++if loadRequested:
+   if loadCheckpointWithRecovery(
+-    checkpointPath,
++    checkpointLoadPath,
+     startIter,
+     population,
+     bestEver,
+@@ -9085,14 +9840,15 @@
+   # Plot after Jev CSV has been validated and truncated to checkpoint generation.
+   # (Calling plotProgress here could accidentally show future/stale Jev scores.)
+ 
+-  echo "Loaded checkpoint: ", checkpointPath,
++  echo "Loaded checkpoint: ", checkpointLoadPath,
+        " next_generation=", startIter,
+        " elite_archive=", eliteOfElites.len,
+        " graph_points=", progressHistory.len
+ else:
+   protectedPrefixCount = 0
+   if loadRequested:
+-    echo "Checkpoint not found: ", checkpointPath, " -> starting a new run."
++    quit("Cannot resume checkpoint or backup: " & checkpointLoadPath &
++         "; refusing to start a new run. Omit --load only when a fresh run is intended.")
+   for i in 0 ..< pop_size:
+     population.add(makeObj())
+   rebuildDataset(sourceChunks, sourceChunkCursor, evalAggsX, evalAggsY)
+@@ -9494,37 +10250,6 @@
+   # これにより「低fitnessだから捨てる」ではなく、「異なるbuilding blockを
+   # 持っているので一度は真面目に測る」というGAらしい選別になる。
+   # ------------------------------------------------------------
+-  proc localRuleDistance(a, b: Rule): float {.inline.} =
+-    var d = abs(a.a.len - b.a.len).float * 0.10
+-    d += abs(a.b.len - b.b.len).float * 0.10
+-    let na = min(4, min(a.a.len, b.a.len))
+-    for k in 0 ..< na:
+-      if a.a[k] != b.a[k]: d += 0.18
+-    let nb = min(4, min(a.b.len, b.b.len))
+-    for k in 0 ..< nb:
+-      if a.b[k] != b.b[k]: d += 0.18
+-    d += min(1.0, abs(a.weight - b.weight) / 4.0) * 0.08
+-    d
+-
+-  proc localGenomeDistance(a, b: Genome): float {.inline.} =
+-    if a.len == 0 or b.len == 0: return 1.0
+-    let probes = min(37, min(a.len, b.len))
+-    if probes <= 0: return 0.0
+-    var d = 0.0
+-    for k in 0 ..< probes:
+-      let ia = (k * (a.len - 1)) div max(1, probes - 1)
+-      let ib = (k * (b.len - 1)) div max(1, probes - 1)
+-      d += localRuleDistance(a[ia], b[ib])
+-    d = d / probes.float
+-    # Different byte dictionaries are also genuine genetic diversity.
+-    if a[0].embedding.len == EMBEDDING_ENTRY_COUNT and
+-        b[0].embedding.len == EMBEDDING_ENTRY_COUNT:
+-      var mapDiff = 0
+-      for byte in countup(0, EMBEDDING_ENTRY_COUNT - 1, 8):
+-        if a[0].embedding[byte] != b[0].embedding[byte]: inc mapDiff
+-      d += 0.50 * float(mapDiff) / 32.0
+-    d
+-
+   proc selectDistantParentId(
+     anchorId: int,
+     candidateIds: openArray[int],
+@@ -9559,6 +10284,7 @@
+     diversityCandidates = pickRandom(pop_size, diversityPoolTarget)
+ 
+   var diversityAdded = 0
++  var screeningDistances = newMinDistanceScratch(pop_size)
+   let diversityTarget = min(FULL_EVAL_DIVERSITY_EXTRA, pop_size - fullIds.len)
+   while diversityAdded < diversityTarget:
+     var bestId = -1
+@@ -9566,9 +10292,7 @@
+     for jp in diversityCandidates:
+       if fullSeen[jp]:
+         continue
+-      var minD = Inf
+-      for sid in fullIds:
+-        minD = min(minD, localGenomeDistance(population[jp], population[sid]))
++      let minD = minimumSelectedDistance(population, jp, fullIds, screeningDistances)
+       # 距離を主目的としつつ、FASTスコアもわずかに加点する。
+       let value = minD + 0.08 * accs[jp]
+       if value > bestValue:
+@@ -9580,9 +10304,7 @@
+       for jp in allIds:
+         if fullSeen[jp]:
+           continue
+-        var minD = Inf
+-        for sid in fullIds:
+-          minD = min(minD, localGenomeDistance(population[jp], population[sid]))
++        let minD = minimumSelectedDistance(population, jp, fullIds, screeningDistances)
+         let value = minD + 0.08 * accs[jp]
+         if value > bestValue:
+           bestValue = value
+@@ -10453,15 +11175,14 @@
+ 
+   let worstFull = accs[order[^1]]
+   let fitnessRange = max(1.0e-9, bestScore - worstFull)
++  var survivorDistances = newMinDistanceScratch(pop_size)
+   while survivorIds.len < keepElites:
+     var bestId = -1
+     var bestValue = -Inf
+     for id in order:
+       if survivorUsed[id] or duplicatesSurvivor(id):
+         continue
+-      var minD = Inf
+-      for sid in survivorIds:
+-        minD = min(minD, localGenomeDistance(population[id], population[sid]))
++      let minD = minimumSelectedDistance(population, id, survivorIds, survivorDistances)
+       # diversityを主軸にしつつ、極端に低fitnessな個体がelite枠を
+       # 取り続けないよう0..1正規化したfitnessを少量だけ加える。
+       let normalizedFitness = max(0.0, min(1.0, (accs[id] - worstFull) / fitnessRange))
+@@ -10550,7 +11271,20 @@
+   # FULL親poolの実効多様性を少数pairで測る。絶対距離そのものではなく、
+   # elite archiveでも使っている0.45閾値を越えるpair比率にすることで
+   # genome長や局所距離スケールへの依存を減らす。
+-  let parentPool = fullIds
++  var parentFingerprints: seq[Hash] = @[]
++  let parentPool = uniqueGenomeIds(population, fullIds, parentFingerprints)
++  var paretoFingerprints: seq[Hash] = @[]
++  let distinctPareto = uniqueGenomeIds(population, paretoPool, paretoFingerprints)
++  var breedingPareto: seq[int] = @[]
++  # Use the same representative ID in every lane so duplicate copies cannot
++  # multiply their breeding allowance simply by occupying multiple slots.
++  for id in distinctPareto:
++    for representative in parentPool:
++      if parentFingerprints[representative] == paretoFingerprints[id] and
++          sameGenomeContent(population[representative], population[id]):
++        if representative notin breedingPareto: breedingPareto.add(representative)
++        break
++  var capacityFallbacks = 0
+   var jevDonorPool: seq[int] = @[]
+   if jevEnabled and fusionReliability > 0.0:
+     var currentPoints: seq[FusionPoint] = @[]
+@@ -10643,8 +11377,10 @@
+     var donorId = survivorIds[rand(survivorIds.len - 1)]
+     if donorId == pId:
+       donorId = survivorIds[(parent + 1) mod survivorIds.len]
+-    let t1 = if op in {coHomologous, coModule}: parentTrace(pId) else: newSeq[RuleTraceRow](0)
+-    let t2 = if op in {coHomologous, coModule}: parentTrace(donorId) else: newSeq[RuleTraceRow](0)
++    let needsTrace = op in {coHomologous, coModule} and
++      population[pId][0].embedding == population[donorId][0].embedding
++    let t1 = if needsTrace: parentTrace(pId) else: newSeq[RuleTraceRow](0)
++    let t2 = if needsTrace: parentTrace(donorId) else: newSeq[RuleTraceRow](0)
+     let started = epochTime()
+     let child = crossoverGenome(population[pId], population[donorId], op, t1, t2)
+     let elapsed = epochTime() - started
+@@ -10654,10 +11390,18 @@
+     crossoverLastSeconds[op] += elapsed
+     new_population.add(child)
+ 
++  var offspringBuckets = initTable[Hash, seq[int]]()
++  for id, genome in new_population:
++    offspringBuckets.mgetOrPut(genomeFingerprint(genome), @[]).add(id)
++  var rescuedDuplicates = 0
++  var unresolvedDuplicates = 0
++
+   while new_population.len < pop_size:
+     let immigrantRate = adaptiveImmigrantRate
+     if rand(1000) < int(immigrantRate * 1000.0):
+-      new_population.add(randomImmigrant())
++      let immigrant = randomImmigrant()
++      offspringBuckets.mgetOrPut(genomeFingerprint(immigrant), @[]).add(new_population.len)
++      new_population.add(immigrant)
+       continue
+ 
+     # ------------------------------------------------------------
+@@ -10668,10 +11412,10 @@
+     # どちらも「毎世代複数の問題/入力で評価した結果」を直接使う。
+     # fullIdsは保護elite + FAST上位 + 遺伝的に遠い個体からなる。
+     # 400個体でも親候補を約1/5まで広げ、実効集団サイズを確保する。
+-    let p1Pool = if rand(99) < PARETO_PARENT_PERCENT: paretoPool else: parentPool
+-    let p2Pool = if rand(99) < PARETO_PARENT_PERCENT: paretoPool else: parentPool
+-    var p1i = selectParentCapped(caseScores, p1Pool, parentUseCount, parentRandomRate)
+-    var p2i = selectParentCapped(caseScores, p2Pool, parentUseCount, parentRandomRate)
++    let p1Pool = if rand(99) < PARETO_PARENT_PERCENT: breedingPareto else: parentPool
++    let p2Pool = if rand(99) < PARETO_PARENT_PERCENT: breedingPareto else: parentPool
++    var p1i = selectBreedingParent(caseScores, p1Pool, parentPool, parentUseCount, parentRandomRate, capacityFallbacks)
++    var p2i = selectBreedingParent(caseScores, p2Pool, parentPool, parentUseCount, parentRandomRate, capacityFallbacks)
+     if p1i < 0:
+       p1i = order[0]
+       inc parentUseCount[p1i]
+@@ -10749,8 +11493,9 @@
+       didCrossover = true
+       let op = if fusionMating: (if rand(1) == 0: coHomologous else: coModule)
+                else: chooseCrossoverOp(crossoverPreference)
+-      let t1 = if op in {coHomologous, coModule}: parentTrace(p1i) else: newSeq[RuleTraceRow](0)
+-      let t2 = if op in {coHomologous, coModule}: parentTrace(p2i) else: newSeq[RuleTraceRow](0)
++      let needsTrace = op in {coHomologous, coModule} and p1[0].embedding == p2[0].embedding
++      let t1 = if needsTrace: parentTrace(p1i) else: newSeq[RuleTraceRow](0)
++      let t2 = if needsTrace: parentTrace(p2i) else: newSeq[RuleTraceRow](0)
+       let started = epochTime()
+       child = crossoverGenome(p1, p2, op, t1, t2)
+       crossoverEmbedding(child, p2)
+@@ -10764,6 +11509,8 @@
+                           min(1.7, 1.0 + 0.55 * stagnationPressure)
+                         else: feedbackMutationScale
+     mutateGenome(child, mutationScale, if explorationLane: stagnation else: 0)
++    let childFingerprint = rescueDuplicateOffspring(child, new_population,
++      offspringBuckets, rescuedDuplicates, unresolvedDuplicates)
+     # Count only actual parent contributions. A subsequent diversity replacement
+     # or an asexual clone may have discarded the initially selected Jev donor.
+     if p1i in jevDonorPool or (didCrossover and p2i in jevDonorPool):
+@@ -10776,7 +11523,25 @@
+       if not duplicate:
+         let due = ((iter + 1) div FUSION_INTERVAL + 1)*FUSION_INTERVAL - 1
+         fusionPending.add(FusionPending(genome: cloneGenome(child), due: due))
++    offspringBuckets.mgetOrPut(childFingerprint, @[]).add(new_population.len)
+     new_population.add(child)
++
++  var usedParents = 0
++  var parentUsesTotal = 0
++  var parentUsesSquared = 0.0
++  var maxParentUses = 0
++  for uses in parentUseCount:
++    if uses > 0: inc usedParents
++    parentUsesTotal += uses
++    parentUsesSquared += float(uses) * float(uses)
++    maxParentUses = max(maxParentUses, uses)
++  let effectiveParents = if parentUsesSquared > 0:
++    float(parentUsesTotal) * float(parentUsesTotal) / parentUsesSquared else: 0.0
++  echo "  breeding: unique_pool=", parentPool.len, "/", fullIds.len,
++       " used_parents=", usedParents, " effective_parents=", formatFloat(effectiveParents, ffDecimal, 1),
++       " max_uses=", maxParentUses, " capacity_fallbacks=", capacityFallbacks,
++       " duplicate_rescues=", rescuedDuplicates, " unresolved_duplicates=", unresolvedDuplicates,
++       " distance_comparisons=", screeningDistances.comparisons + survivorDistances.comparisons
+ 
+   # Local weight search has already refreshed caseScores before this capture.
+   carriedCaseScores = newSeq[seq[float]](survivorIds.len)
+--- previous/verify_and_run.sh
++++ optimized/verify_and_run.sh
+@@ -1,31 +1,49 @@
+ #!/usr/bin/env bash
+ set -eu
+ cd -- "$(dirname -- "$0")"
+-checkpoint=ga_checkpoint.bin
++load_path=ga_checkpoint.bin
++save_path=
+ load_requested=0
++save_explicit=0
+ for arg in "$@"; do
+   case "$arg" in
+     --load) load_requested=1 ;;
+-    --load=*) load_requested=1; checkpoint=${arg#--load=} ;;
+-    --save=*) checkpoint=${arg#--save=} ;;
++    --load=*) load_requested=1; load_path=${arg#--load=} ;;
++    --save=*) save_explicit=1; save_path=${arg#--save=} ;;
+   esac
+ done
+-if [ "$load_requested" = 1 ] && [ ! -f "$checkpoint" ]; then
+-  echo "Checkpoint not found: $checkpoint. Copy it here or pass --load=/absolute/path." >&2
++if [ "$save_explicit" = 0 ]; then save_path=$load_path; fi
++if [ -z "$load_path" ] || [ -z "$save_path" ]; then
++  echo "Checkpoint paths must not be empty." >&2
++  exit 1
++fi
++if [ "$load_requested" = 1 ] && [ ! -f "$load_path" ] && [ ! -f "$load_path.bak" ]; then
++  echo "Checkpoint and backup not found: $load_path" >&2
+   exit 1
+ fi
+ nim c -d:release --threads:on --gc:orc -o:at_jev_checked at_jev.nim
++./at_jev_checked --bottleneck-test
+ ./at_jev_checked --refinement-test
+ ./at_jev_checked --fusion-test
+ ./at_jev_checked --generation-index-test
+ ./at_jev_checked --regression-test
+ ./at_jev_checked --self-test
+ python3 -m unittest discover -s . -p 'test_*.py'
+-if [ -f "$checkpoint" ]; then
+-  backup_dir=$(mktemp -d ./pre_embedding256_backup.XXXXXX)
+-  for file in "$checkpoint" "$checkpoint.bak" "$checkpoint.model" "$checkpoint.jev_progress.csv" "$checkpoint.jev_progress.csv.config.json"; do
+-    if [ -f "$file" ]; then cp -p -- "$file" "$backup_dir/"; fi
++backup_dir=
++backup_checkpoint() {
++  source_path=$1
++  label=$2
++  for file in "$source_path" "$source_path.bak" "$source_path.model" "$source_path.jev_progress.csv" "$source_path.jev_progress.csv.config.json"; do
++    if [ -f "$file" ]; then
++      if [ -z "$backup_dir" ]; then backup_dir=$(mktemp -d ./pre_run_backup.XXXXXX); fi
++      mkdir -p -- "$backup_dir/$label"
++      cp -p -- "$file" "$backup_dir/$label/"
++    fi
+   done
+-  echo "Previous checkpoint preserved: $backup_dir"
++}
++if [ "$load_requested" = 1 ]; then backup_checkpoint "$load_path" input; fi
++if [ "$load_requested" = 0 ] || [ "$save_path" != "$load_path" ]; then
++  backup_checkpoint "$save_path" output
+ fi
++if [ -n "$backup_dir" ]; then echo "Previous files preserved: $backup_dir"; fi
+ exec ./at_jev_checked "$@"

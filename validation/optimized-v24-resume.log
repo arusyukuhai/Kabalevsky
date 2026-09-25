@@ -1,0 +1,102 @@
+corpus stats: ngram_seeds=193 chunks=32
+[migration] v25 256-token objective: old scores/archive/Jev Hall discarded; genomes migrated
+Loaded checkpoint: legacy_v24.bin next_generation=11 elite_archive=0 graph_points=0
+evaluation mode: parallel individual evaluation (--threads:on)
+rolling evaluation schedule: fast=11, medium=3, slow=2; credit scheduler, at most one refresh per generation
+Jev lane OFF: set TYPESAFE_API_KEY (or JEV_API_KEY), put jev_bridge.py next to binary, and omit --no-jev
+gen=11 dataset rolling refresh: fast=true medium=false slow=false total_cases=3 total_samples=122
+  genetic parent pool(full)=107 / 450 (elite=80, meritTop=16, diversity=8)
+  case_refresh_delta[0]=unavailable (no carried survivors)
+  fast_rejection_audit: sampled=8 remaining=343 missed_merit=2 missed_best=0 max_merit_margin=0.01085268706521525
+  screening fast/full spearman=0.669 adaptive_extra=8 fast_rounds_next=16 fast_stride_next=5 fast_points_next=[9,9,9] lex_eps=@[0.01925723148162889, 0.021801273747067085, 0.006566206962082988]
+gen=11 best=0.9703535866322079 score_rounds=ceil(2*sqrt(input.len)) rules=16
+  paired_incumbent_gain=0.0 refreshed_fast=true refreshed_medium=false refreshed_slow=false fast_screened=370 full_evaluated=123
+  archive_gate: ready=false window=0/75 log_score=5.07599861213628 log_mean=0.0 log_stddev=0.0 log_threshold=inf qualified=false
+  runtime_pareto: candidates=123 near_best_front=4 champion_seconds=0.00030 fastest_front_seconds=0.00024 score_slack=0.012 parent_share=30%
+  diversity_pair_rate=0.919 parent_random=0.035 immigrant=0.005
+PASS: generation 11 parent accounting, parent immutability, elite retention, valid embeddings
+  breeding: unique_pool=116/123 used_parents=90 effective_parents=51.2 max_uses=16 capacity_fallbacks=0 duplicate_rescues=42 unresolved_duplicates=0 distance_comparisons=9443
+  work_counts: pattern_revision_updates=7200 candidate_index_rebuilds=450 trace_builds=31 trace_seconds=0.0005
+  gen=11 timing(s): total=0.056 compile=0.006 fast_eval=0.014 full_id_select=0.003 full_eval=0.019 jev=0.000 repro_other=0.013
+gen=12 dataset rolling refresh: fast=false medium=true slow=false total_cases=3 total_samples=122
+  genetic parent pool(full)=77 / 450 (elite=40, meritTop=16, diversity=8)
+  case_refresh_delta[1]=-0.051547 identical_survivors=40
+  mutation_probe_success=0.0 paired_delta=-0.006470576533841393 changed_probes=4 decisive=2 neutral=2 mutation_scale=1.0
+  crossover_probe op=coHomologous changed=1 wins=0 neutral=0 paired_delta=-0.119143 ema=-0.010000 generated=56 crossover_seconds=0.0003
+  crossover_probe op=coModule changed=1 wins=0 neutral=0 paired_delta=-0.031727 ema=-0.003173 generated=61 crossover_seconds=0.0004
+  crossover_probe op=coTwoPoint changed=1 wins=0 neutral=0 paired_delta=-0.004104 ema=-0.000410 generated=65 crossover_seconds=0.0004
+  crossover_probe op=coMacro changed=0 wins=0 neutral=1 paired_delta=0.000000 ema=0.000000 generated=63 crossover_seconds=0.0003
+  fast_rejection_audit: sampled=8 remaining=373 missed_merit=0 missed_best=0 max_merit_margin=0.0011141640217963156
+  screening fast/full spearman=0.911 adaptive_extra=0 fast_rounds_next=15 fast_stride_next=6 fast_points_next=[8,8,8] lex_eps=@[0.009830727246320614, 0.010418359238658192, 0.004]
+  champion_change: dataset_delta=-0.008041616121019834 selection_gain=0.012450999163587717 observed_delta=0.004409383042567883
+gen=12 best=0.9747629696747758 score_rounds=ceil(2*sqrt(input.len)) rules=16
+  paired_incumbent_gain=0.002863648312436351 refreshed_fast=false refreshed_medium=true refreshed_slow=false fast_screened=400 full_evaluated=85
+  archive_gate: ready=false window=1/75 log_score=5.3083140333026755 log_mean=0.0 log_stddev=0.0 log_threshold=inf qualified=false
+  runtime_pareto: candidates=85 near_best_front=5 champion_seconds=0.00147 fastest_front_seconds=0.00026 score_slack=0.012 parent_share=30%
+  diversity_pair_rate=0.973 parent_random=0.035 immigrant=0.005
+PASS: generation 12 parent accounting, parent immutability, elite retention, valid embeddings
+  breeding: unique_pool=82/85 used_parents=71 effective_parents=46.9 max_uses=16 capacity_fallbacks=0 duplicate_rescues=45 unresolved_duplicates=0 distance_comparisons=6454
+  work_counts: pattern_revision_updates=7156 candidate_index_rebuilds=448 trace_builds=26 trace_seconds=0.0005
+  gen=12 timing(s): total=0.049 compile=0.004 fast_eval=0.023 full_id_select=0.002 full_eval=0.009 jev=0.000 repro_other=0.011
+gen=13 dataset rolling refresh: fast=false medium=false slow=true total_cases=3 total_samples=122
+  genetic parent pool(full)=77 / 450 (elite=40, meritTop=16, diversity=8)
+  case_refresh_delta[2]=-0.162991 identical_survivors=40
+  mutation_probe_success=0.0 paired_delta=-0.0726329065074015 changed_probes=4 decisive=3 neutral=1 mutation_scale=0.9988007197120864
+  crossover_probe op=coHomologous changed=1 wins=0 neutral=0 paired_delta=0.000000 ema=-0.009000 generated=55 crossover_seconds=0.0003
+  crossover_probe op=coModule changed=1 wins=0 neutral=0 paired_delta=-0.087031 ema=-0.011559 generated=56 crossover_seconds=0.0002
+  crossover_probe op=coTwoPoint changed=1 wins=0 neutral=0 paired_delta=0.000000 ema=-0.000369 generated=73 crossover_seconds=0.0004
+  crossover_probe op=coMacro changed=1 wins=1 neutral=0 paired_delta=0.005045 ema=0.000504 generated=54 crossover_seconds=0.0002
+  fast_rejection_audit: sampled=8 remaining=373 missed_merit=0 missed_best=0 max_merit_margin=0.004930591675010421
+  screening fast/full spearman=0.755 adaptive_extra=8 fast_rounds_next=16 fast_stride_next=6 fast_points_next=[8,8,8] lex_eps=@[0.004, 0.010562582542406662, 0.035]
+  champion_change: dataset_delta=-0.00476807084174613 selection_gain=0.0 observed_delta=-0.00476807084174613
+gen=13 best=0.9699948988330297 score_rounds=ceil(2*sqrt(input.len)) rules=16
+  paired_incumbent_gain=0.0 refreshed_fast=false refreshed_medium=false refreshed_slow=true fast_screened=400 full_evaluated=93
+  archive_gate: ready=true window=2/75 log_score=5.058648395631329 log_mean=5.192156322719478 log_stddev=0.1161577105831979 log_threshold=5.3083140333026755 qualified=false
+  runtime_pareto: candidates=93 near_best_front=4 champion_seconds=0.00138 fastest_front_seconds=0.00032 score_slack=0.012 parent_share=30%
+  diversity_pair_rate=0.919 parent_random=0.035 immigrant=0.005
+PASS: generation 13 parent accounting, parent immutability, elite retention, valid embeddings
+  breeding: unique_pool=91/93 used_parents=82 effective_parents=51.1 max_uses=16 capacity_fallbacks=0 duplicate_rescues=35 unresolved_duplicates=0 distance_comparisons=6711
+  work_counts: pattern_revision_updates=7066 candidate_index_rebuilds=448 trace_builds=24 trace_seconds=0.0003
+  gen=13 timing(s): total=0.051 compile=0.004 fast_eval=0.017 full_id_select=0.002 full_eval=0.018 jev=0.000 repro_other=0.011
+gen=14 dataset rolling refresh: fast=false medium=false slow=true total_cases=3 total_samples=122
+  genetic parent pool(full)=76 / 450 (elite=40, meritTop=16, diversity=8)
+  case_refresh_delta[2]=0.105368 identical_survivors=40
+  mutation_probe_success=0.3333333333333333 paired_delta=-0.07403448039441644 changed_probes=3 decisive=3 neutral=0 mutation_scale=0.9985210946599011
+  crossover_probe op=coHomologous changed=1 wins=0 neutral=0 paired_delta=0.000000 ema=-0.008100 generated=66 crossover_seconds=0.0006
+  crossover_probe op=coModule changed=1 wins=0 neutral=0 paired_delta=-0.009411 ema=-0.011344 generated=65 crossover_seconds=0.0003
+  crossover_probe op=coTwoPoint changed=1 wins=0 neutral=0 paired_delta=0.000000 ema=-0.000332 generated=55 crossover_seconds=0.0003
+  crossover_probe op=coMacro changed=1 wins=0 neutral=0 paired_delta=-0.066521 ema=-0.006198 generated=61 crossover_seconds=0.0003
+  fast_rejection_audit: sampled=8 remaining=374 missed_merit=0 missed_best=0 max_merit_margin=-0.0021063681679686086
+  screening fast/full spearman=0.874 adaptive_extra=0 fast_rounds_next=15 fast_stride_next=7 fast_points_next=[7,7,7] lex_eps=@[0.008373496268275105, 0.014175647139003905, 0.004]
+  champion_change: dataset_delta=0.007938741183925901 selection_gain=0.0023018832261177957 observed_delta=0.010240624410043697
+gen=14 best=0.9802355232430734 score_rounds=ceil(2*sqrt(input.len)) rules=16
+  paired_incumbent_gain=0.0023018832261177957 refreshed_fast=false refreshed_medium=false refreshed_slow=true fast_screened=400 full_evaluated=84
+  archive_gate: ready=true window=3/75 log_score=5.6609464278972075 log_mean=5.147653680356761 log_stddev=0.113824629027059 log_threshold=5.26147830938382 qualified=true
+  ★ Elite-of-Elites archived: size=1 score=0.9802355232430734 admission=log-mean-plus-1stddev threshold_rho=0.9739302295372572 slow_improved=false generation=14
+  runtime_pareto: candidates=84 near_best_front=5 champion_seconds=0.00035 fastest_front_seconds=0.00032 score_slack=0.012 parent_share=30%
+  diversity_pair_rate=0.919 parent_random=0.035 immigrant=0.005
+PASS: generation 14 parent accounting, parent immutability, elite retention, valid embeddings
+  breeding: unique_pool=81/84 used_parents=68 effective_parents=46.1 max_uses=16 capacity_fallbacks=0 duplicate_rescues=26 unresolved_duplicates=0 distance_comparisons=6415
+  work_counts: pattern_revision_updates=6875 candidate_index_rebuilds=441 trace_builds=28 trace_seconds=0.0006
+  gen=14 timing(s): total=0.059 compile=0.005 fast_eval=0.029 full_id_select=0.002 full_eval=0.011 jev=0.000 repro_other=0.011
+gen=15 dataset rolling refresh: fast=false medium=true slow=false total_cases=3 total_samples=122
+  genetic parent pool(full)=77 / 450 (elite=40, meritTop=16, diversity=8)
+  case_refresh_delta[1]=-0.195151 identical_survivors=40
+  mutation_probe_success=0.0 paired_delta=-0.1678499664642196 changed_probes=3 decisive=3 neutral=0 mutation_scale=0.9970722941141937
+  crossover_probe op=coHomologous changed=1 wins=0 neutral=0 paired_delta=-0.059883 ema=-0.013278 generated=64 crossover_seconds=0.0003
+  crossover_probe op=coModule changed=1 wins=0 neutral=0 paired_delta=-0.054348 ema=-0.015644 generated=51 crossover_seconds=0.0003
+  crossover_probe op=coTwoPoint changed=1 wins=0 neutral=0 paired_delta=0.000000 ema=-0.000299 generated=57 crossover_seconds=0.0003
+  crossover_probe op=coMacro changed=1 wins=0 neutral=0 paired_delta=0.000000 ema=-0.005578 generated=65 crossover_seconds=0.0003
+  fast_rejection_audit: sampled=8 remaining=373 missed_merit=2 missed_best=0 max_merit_margin=0.030325928220992004
+  screening fast/full spearman=0.839 adaptive_extra=6 fast_rounds_next=16 fast_stride_next=6 fast_points_next=[8,8,8] lex_eps=@[0.007014278883974268, 0.035, 0.004758026937498827]
+  champion_change: dataset_delta=-0.008773658037625087 selection_gain=0.004734819869113949 observed_delta=-0.0040388381685111385
+gen=15 best=0.9761966850745623 score_rounds=ceil(2*sqrt(input.len)) rules=16
+  paired_incumbent_gain=0.0017489023893312305 refreshed_fast=false refreshed_medium=true refreshed_slow=false fast_screened=400 full_evaluated=91
+  archive_gate: ready=true window=4/75 log_score=5.392693687944593 log_mean=5.275976867241873 log_stddev=0.2431410197949216 log_threshold=5.519117887036795 qualified=false
+  runtime_pareto: candidates=91 near_best_front=9 champion_seconds=0.00057 fastest_front_seconds=0.00035 score_slack=0.012 parent_share=30%
+  diversity_pair_rate=0.919 parent_random=0.035 immigrant=0.005
+PASS: generation 15 parent accounting, parent immutability, elite retention, valid embeddings
+  breeding: unique_pool=88/91 used_parents=73 effective_parents=46.5 max_uses=16 capacity_fallbacks=0 duplicate_rescues=49 unresolved_duplicates=0 distance_comparisons=6536
+  work_counts: pattern_revision_updates=6888 candidate_index_rebuilds=447 trace_builds=22 trace_seconds=0.0003
+  gen=15 timing(s): total=0.049 compile=0.005 fast_eval=0.018 full_id_select=0.002 full_eval=0.012 jev=0.000 repro_other=0.011
+[checkpoint] saved: converted_v25.bin (next_generation=16)

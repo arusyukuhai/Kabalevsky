@@ -1,0 +1,13 @@
+PASS: incremental distance gives identical selected IDs; comparisons 40700 -> 3072
+PASS: V1 headers (including ambiguous 48/304 rules), V10 model roundtrip, order-independent load/save
+PASS: planned cross-map block transfer equals per-row translation; parents unchanged
+PASS: all four crossover operators match prior content under identical seeds; mutation preserves parents
+PASS: narrow-pool saturation broadens to FULL pool; max uses 512 -> 16
+mutation_baseline no_change=325/512 scale=0.35
+PASS: duplicate rescue changes real weights, preserves parents/signs, handles hash collision
+PASS: candidate index grows safely and clears removed keys on shrink
+PASS: candidate order and exact scores/features match reference (sparse/dense, repeated/OOV tokens)
+scan_benchmark repeated=false before_s=0.081967508 after_s=0.034593137999999996 speedup=2.3694730440470595
+scan_benchmark repeated=true before_s=0.024408805000000006 after_s=0.02325139400000001 speedup=1.0497781337325407
+score_benchmark before_s=0.4910566310000001 after_s=0.39852464700000007 speedup=1.2321863520777423
+transfer_benchmark before_s=0.28913449300000016 after_s=0.054150668000000346 speedup=5.339444621440281
