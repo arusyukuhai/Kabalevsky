@@ -2600,7 +2600,7 @@ const JEV_BRIDGE_PROTOCOL = 1
 const JEV_MAX_MODELS = 64
 const JEV_DEFAULT_MODELS = 64
 const JEV_GENERATION_INTERVAL = 20
-const JEV_STEPS = 6400
+const JEV_STEPS = 4800
 const JEV_SUFFIX_LENGTH = 64
 # Inner TEXT GA, independent for each outer Genome. Evaluations include the
 # initial population and every offspring; reusing an elite costs no evaluation.
