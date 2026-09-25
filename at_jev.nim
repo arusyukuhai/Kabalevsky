@@ -487,7 +487,7 @@ type
     presentBits: seq[uint64] # exact key membership, 257^2 bits at embedding 256
 
   # One-token buckets remain dense (513 entries is tiny), while two-token
-  # buckets are sparse. A dense 513^2 table per genome would still waste memory across 450 genomes despite only ~2100 rule anchors being used.
+  # buckets are sparse. A dense 513^2 table per genome would still waste memory across 450 genomes despite only ~1500 rule anchors being used.
   CandidateIndex = ref object
     head1: array[INDEX_TOKEN_COUNT, int32]
     head2: PairHeadIndex
@@ -501,7 +501,7 @@ proc pairKey(a, b: int): int {.inline.} =
   a * INDEX_TOKEN_COUNT + b
 
 proc initPairHeadIndex(expectedEntries: int): PairHeadIndex =
-  # <= 0.5 load keeps lookup to ~1-2 probes for the normal 2100-rule model.
+  # <= 0.5 load keeps lookup to ~1-2 probes for the normal 1500-rule model.
   var cap = 32
   let wanted = max(1, expectedEntries) * 2
   while cap < wanted: cap = cap shl 1
@@ -2153,8 +2153,8 @@ randomize()
 const WORKER_POOL_CAP = 64
 let workerCount = max(1, min(countProcessors(), WORKER_POOL_CAP))
 
-const LEGACY_RULE_COUNT = 2100
-var AAA = 2100
+const LEGACY_RULE_COUNT = 1500
+var AAA = 1500
 
 # ------------------------------------------------------------
 # ★大改修: コーパス統計を使ったパターン初期化/突然変異
@@ -2514,7 +2514,7 @@ proc makeObj(): Genome =
   if result.len > 0: result[0].embedding = mapping
 
 proc expandLegacyGenome(g: var Genome): bool =
-  ## Retain the original 2100 rules in order; append 3300 seeded rules for AAA=2100.
+  ## Retain the original 1500 rules in order; append 3300 seeded rules for AAA=1500.
   ## Called only while loading, before any evaluator threads run.
   if g.len == AAA: return false
   if g.len != LEGACY_RULE_COUNT or AAA <= LEGACY_RULE_COUNT:
@@ -2631,7 +2631,7 @@ var jevHallConfig = "" # same prompt/model/steps/cohort configuration as the qua
 
 # NOTE:
 # Genome の a/b は seq なので参照共有される。
-# 世代交代時に全2100行を深コピーすると非常に重い。
+# 世代交代時に全1500行を深コピーすると非常に重い。
 # そこで GA 側は shallow copy + 「変更直前だけ」copy-on-write にする。
 proc cloneRuleShallow(r: Rule): Rule =
   Rule(
@@ -2873,7 +2873,7 @@ proc buildCrossoverTrace(
     else:
       state = cloneInts(sample)
     let maxTraceLen = min(32768,
-      max(2100 * (if embedded: EMBEDDING_WIDTH else: 1), state.len * 32))
+      max(1500 * (if embedded: EMBEDDING_WIDTH else: 1), state.len * 32))
     scratch.candidateScratch.candidateValid = false
     for k in 0 ..< g.len:
       if not scratch.candidateScratch.candidateValid:
@@ -2986,7 +2986,7 @@ proc sampleCrossoverLength(n: int, maxLen: int = high(int)): int =
 proc sampleCrossoverSegment(n: int): tuple[l, r: int] =
   ## Most ordinary crossover is a local building-block transfer. A bounded
   ## macro lane remains explicit rather than letting every two-point crossover
-  ## silently draw from the entire 2100-rule genome.
+  ## silently draw from the entire 1500-rule genome.
   if n <= 0: return (0, 0)
   if rand(99) >= CROSSOVER_MACRO_PERCENT:
     let length = sampleCrossoverLength(n, LOCAL_CROSSOVER_MAX_RULES)
@@ -3423,7 +3423,7 @@ proc ifftFftWeightTransform(
     return
 
   # ★修正: fftInPlace は 2 の冪長を前提にしている。
-  # 以前は n (= genome長。例えば2100) をそのまま渡していたため、
+  # 以前は n (= genome長。例えば1500) をそのまま渡していたため、
   # n が2の冪でない場合にバタフライ演算が配列境界外へ読み書きし、
   # release ビルド(境界チェック無効)ではヒープ破壊 → 断続的な
   # SIGSEGV の原因になっていた。ここで2の冪長へゼロ詰めしてから
@@ -3619,7 +3619,7 @@ proc mutateGenome(
   mutationCountCap: int = high(int)
 ) =
   ## Every count-bearing rule mutation remains log-uniform.  The exploitation
-  ## lane uses a bounded valid range so a near-converged 2100-rule program can
+  ## lane uses a bounded valid range so a near-converged 1500-rule program can
   ## actually make small edits; the explicit exploration lane still uses 1..N.
   if g.len == 0:
     return
@@ -3867,7 +3867,7 @@ proc sortIndicesByScore(scores: openArray[float]): seq[int] =
 # には一切触れない。これにより spawn / {.gcsafe.} の条件を満たす。
 #
 # 粒度は「個体1体まるごと」。各ラウンドで1文字列に対して
-# 2100ルールを順次適用し、長さ超過でそのサンプルの処理を終了する。
+# 1500ルールを順次適用し、長さ超過でそのサンプルの処理を終了する。
 # 仕事量・時間予算の超過は評価例外として扱う。
 # ------------------------------------------------------------
 proc seenAttPairContains(
@@ -3973,7 +3973,7 @@ proc scoreRaw(
   let embedded = genome[0].embedding.len == EMBEDDING_ENTRY_COUNT
   let encodedLen = if embedded: input.len * EMBEDDING_WIDTH else: input.len
   let maxAggLen = min(32768,
-    max(2100 * (if embedded: EMBEDDING_WIDTH else: 1), encodedLen * 32))
+    max(1500 * (if embedded: EMBEDDING_WIDTH else: 1), encodedLen * 32))
   # Maintain the original compute budget rather than doubling sqrt(N) rounds
   # merely because an external byte is represented by three digits.
   let rounds = min(maxRounds, max(1, int(ceil(2 * sqrt(float(input.len))))))
@@ -4253,7 +4253,7 @@ proc evaluateIndividualCases(
   if n == 0:
     return
 
-  # weightScore(w) は現在恒等写像なので、2100要素のscore配列を
+  # weightScore(w) は現在恒等写像なので、1500要素のscore配列を
   # 個体ごとに構築せず evaluateChunk から genome[k].weight を直接読む。
   template evalScratch: var EvalScratch = getThreadEvalScratch(ruleCount)
 
@@ -4691,7 +4691,7 @@ proc evaluateIndividualWithCredit(
 ): float {.gcsafe.} =
   ## 通常評価と同じ単一路径の規則適用を辿りながら、
   ## 「各ruleが各sampleの出力へどれだけ寄与したか」を蓄積する。
-  ## アブレーションのように2100回再評価する必要はなく、追加コストは
+  ## アブレーションのように1500回再評価する必要はなく、追加コストは
   ## 実際に発火したruleの本数にほぼ比例する。
   outCredit.setLen(ruleCount)
   outCredit.fill(0.0)
@@ -4700,7 +4700,7 @@ proc evaluateIndividualWithCredit(
 
   var stats = newSeq[RuleCreditStat](ruleCount)
   ## statsは「このchunkで一度でも発火したrule」だけを初期化する。
-  ## 毎sampleでruleCount全体をfillするのは、ruleCount≈2100では無視できない。
+  ## 毎sampleでruleCount全体をfillするのは、ruleCount≈1500では無視できない。
   var statTouched = newSeq[int](0)
   var creditSum = newSeq[float](ruleCount)
   # weightScore(w) == w のためruleScores配列は不要。
@@ -5550,7 +5550,7 @@ let eliteCount = 40
 # merit FULL-evaluation bandwidth every generation.
 const ARCHIVE_INJECT_COUNT = 8
 const ARCHIVE_INJECT_INTERVAL = 4
-# 長時間運転で「新記録」のたびに2100-rule genomeを無制限に保持すると
+# 長時間運転で「新記録」のたびに1500-rule genomeを無制限に保持すると
 # アーカイブだけでメモリを食い潰す可能性があるため上限を設ける。
 const ARCHIVE_MAX_ENTRIES = 2048
 
@@ -5626,7 +5626,7 @@ const WEIGHT_LOCAL_SEARCH_INTERVAL = 128
 const IMMIGRANT_RATE = 0.005
 const STAGNATION_IMMIGRANT_BONUS = 0.03
 
-# Local refinement must remain genuinely local once a 2100-rule genome is
+# Local refinement must remain genuinely local once a 1500-rule genome is
 # already good. Counts are still log-uniform; only the valid upper bound differs
 # by lane. Exploration keeps the full 1..N range.
 const LOCAL_MUTATION_MIN_RULES = 12
@@ -5640,7 +5640,7 @@ const CROSSOVER_TRACE_SAMPLE_COUNT = 6
 
 proc localMutationCap(stagnation: int): int {.inline.} =
   ## Smoothly widen only the local lane as a plateau persists. Even at maximum
-  ## pressure it stays far below the 2100-rule macro lane.
+  ## pressure it stays far below the 1500-rule macro lane.
   let pressure = min(1.0, sqrt(float(max(0, stagnation))) / 6.0)
   int(round(float(LOCAL_MUTATION_MIN_RULES) +
     pressure * float(LOCAL_MUTATION_MAX_RULES - LOCAL_MUTATION_MIN_RULES)))
@@ -7523,8 +7523,8 @@ proc resolveCheckpointPaths(args: seq[string]): tuple[loadRequested: bool, loadP
 proc optimizeText(
     modelPath, prompt, outputPath: string,
     count, steps, seed, requestedPopulation: int) =
-  if count < 1 or count > 2100 or steps < 1:
-    quit("--length must be 1..2100 appended Unicode characters; --steps must be positive.")
+  if count < 1 or count > 1500 or steps < 1:
+    quit("--length must be 1..1500 appended Unicode characters; --steps must be positive.")
   if requestedPopulation < 8 or requestedPopulation > 256:
     quit("--population must be 8..256.")
   if unicode.validateUtf8(prompt) != -1:
@@ -7559,7 +7559,7 @@ proc optimizeText(
   # cache in one operation and abruptly turned converged duplicates back into
   # expensive scoreRaw calls. Evict one oldest key at a time instead.
   # Bound cached UTF-8 key bytes too: a 32,768-entry cache is cheap at length 64
-  # but huge at length 2100, causing a second allocator/GC cliff.
+  # but huge at length 1500, causing a second allocator/GC cliff.
   const GENERATION_MEMO_MAX_ENTRIES = 32768
   const GENERATION_MEMO_KEY_BYTE_BUDGET = 16 * 1024 * 1024
   var memo = initTable[string, float]()
@@ -7607,7 +7607,7 @@ proc optimizeText(
     let whole = prompt & key
     let rawBytes = whole.len
     let expectedRounds = max(1, int(ceil(2 * sqrt(float(max(1, rawBytes))))))
-    let expectedMaxAgg = min(32768, max(2100, rawBytes * 32))
+    let expectedMaxAgg = min(32768, max(1500, rawBytes * 32))
     minObservedInputBytes = min(minObservedInputBytes, rawBytes)
     maxObservedInputBytes = max(maxObservedInputBytes, rawBytes)
     minObservedRounds = min(minObservedRounds, expectedRounds)
@@ -8564,7 +8564,7 @@ if "--bottleneck-test" in commandLineParams():
     let embedded = genome[0].embedding.len == EMBEDDING_ENTRY_COUNT
     let encodedLen = if embedded: input.len * EMBEDDING_WIDTH else: input.len
     let maxAggLen = min(32768,
-      max(2100 * (if embedded: EMBEDDING_WIDTH else: 1), encodedLen * 32))
+      max(1500 * (if embedded: EMBEDDING_WIDTH else: 1), encodedLen * 32))
     # Maintain the original compute budget rather than doubling sqrt(N) rounds
     # merely because an external byte is represented by three digits.
     let rounds = min(maxRounds, max(1, int(ceil(2 * sqrt(float(input.len))))))
@@ -8866,7 +8866,7 @@ if "--bottleneck-test" in commandLineParams():
   echo "PASS: duplicate rescue changes real weights, preserves parents/signs, handles hash collision"
 
   var g=cloneGenome(pop[0])
-  for i in g.len..<2100:
+  for i in g.len..<1500:
     g.add(Rule(a: @[rand(255),rand(255)], b: @[rand(255)], weight:rand(2.0)-1.0,
       patternRevision:freshPatternRevision(),replacementRevision:freshReplacementRevision()))
   var compiled:seq[SeqPattern] = @[]
@@ -8892,7 +8892,7 @@ if "--bottleneck-test" in commandLineParams():
       sample.add(if trial mod 2 == 0: rand(255) else: [32,65,66,32,65,66,257,-2][i mod 8])
     samples.add(sample)
     for index in [sparse,dense]:
-      for lower in [0,100,1499,2100]:
+      for lower in [0,100,1499,1500]:
         scanCandidateIdsReference(index,sample,a.candidateIds,a.candidateScratch,lower)
         scanCandidateIds(index,sample,b.candidateIds,b.candidateScratch,lower)
         doAssert a.candidateIds == b.candidateIds
@@ -8942,7 +8942,7 @@ if "--bottleneck-test" in commandLineParams():
           for i in 0..<g.len: child[i]=transplantRule(bigDonor[i],bigDonor[0].embedding,bigBase[0].embedding)
           child[0].embedding=bigBase[0].embedding
         else: child=twoPointGenomeCrossover(bigBase,bigDonor,0,g.len)
-        doAssert child.len==2100
+        doAssert child.len==1500
       if useOld:oldTransferTime+=cpuTime()-start
       else:newTransferTime+=cpuTime()-start
   echo "transfer_benchmark before_s=",oldTransferTime," after_s=",newTransferTime,
@@ -9058,7 +9058,7 @@ if "--refinement-test" in commandLineParams():
 if "--generation-index-test" in commandLineParams():
   var g: Genome = @[]
   randomize(83129)
-  for i in 0..<2100:
+  for i in 0..<1500:
     let a = @[rand(255), rand(255)]
     let b = @[rand(255)]
     g.add(Rule(a:a,b:b,weight:float(i mod 7)-3.0,
@@ -9344,12 +9344,12 @@ if "--regression-test" in commandLineParams():
   doAssert replaceSeq(@[97,49,98,97,50,98], @[97,-1,98], @[-1]) == @[49,50]
   # Boundary regression: 1,500 bytes must remain exactly 1,500 tokens.
   block:
-    let original = repeat(65, 2100)
+    let original = repeat(65, 1500)
     let mapping = defaultEmbedding()
     var encoded: seq[int] = @[]
     embedBytesInto(original, mapping, encoded)
-    doAssert encoded.len == 2100 and encoded[1499] == 65
-    var edgeInput = repeat(1, 2100)
+    doAssert encoded.len == 1500 and encoded[1499] == 65
+    var edgeInput = repeat(1, 1500)
     edgeInput[0] = 0
     let edgePattern = compileSeqPattern(@[0, -1])
     var edgeScratch = ReplaceScratch(sortBuf: @[])
@@ -9358,12 +9358,12 @@ if "--regression-test" in commandLineParams():
     var edgeOverflow = false
     compileReplacementPlan(@[-1, 0], edgePlan)
     doAssert replaceSeqCompiledInto(edgeInput, edgePattern, @[-1, 0],
-      edgeOutput, edgeScratch, addr edgePlan, addr edgeOverflow, 2100)
-    doAssert not edgeOverflow and edgeOutput.len == 2100
+      edgeOutput, edgeScratch, addr edgePlan, addr edgeOverflow, 1500)
+    doAssert not edgeOverflow and edgeOutput.len == 1500
     doAssert edgeOutput[0] == 1 and edgeOutput[1499] == 0
     compileReplacementPlan(@[-1, 0, 0], edgePlan)
     doAssert not replaceSeqCompiledInto(edgeInput, edgePattern, @[-1, 0, 0],
-      edgeOutput, edgeScratch, addr edgePlan, addr edgeOverflow, 2100)
+      edgeOutput, edgeScratch, addr edgePlan, addr edgeOverflow, 1500)
     doAssert edgeOverflow and edgeOutput.len == 0
     var embeddedGenome = @[testRule(@[65], @[65], 1.0)]
     embeddedGenome[0].embedding = mapping
@@ -9372,26 +9372,26 @@ if "--regression-test" in commandLineParams():
     var embeddedScratch = newEvalScratch(embeddedGenome.len)
     doAssert scoreRaw(embeddedGenome, embeddedCompiled, embeddedIndex,
       original, embeddedScratch, 1) == 1.0
-    echo "PASS: 2100-byte / 2100-token embedding and exact output boundary"
+    echo "PASS: 1500-byte / 1500-token embedding and exact output boundary"
     # An invalid capture must be rejected before arithmetic/sort/reverse/copy
-    # accesses input[2100], or before the unchecked bulk copy corrupts memory.
+    # accesses input[1500], or before the unchecked bulk copy corrupts memory.
     for opcode in [-1, -16, -32, -48, -64, -80, -96]:
       var badPlan: ReplacementPlan
       compileReplacementPlan(@[opcode], badPlan)
-      var badCaptures = [Capture(start: 2100, len: 1)]
+      var badCaptures = [Capture(start: 1500, len: 1)]
       var badOutput: seq[int] = @[]
       var badOverflow = false
       var rejected = false
       try:
         appendReplacementPlan(badOutput, addr badPlan, edgeInput,
-          badCaptures, 1, edgeScratch, badOverflow, 2100)
+          badCaptures, 1, edgeScratch, badOverflow, 1500)
       except SeqReplaceError:
         rejected = true
       doAssert rejected
     var copyRejected = false
     try:
       var invalidCopy: seq[int] = @[]
-      appendIntsBulk(invalidCopy, edgeInput, 2100, 1)
+      appendIntsBulk(invalidCopy, edgeInput, 1500, 1)
     except SeqReplaceError:
       copyRejected = true
     doAssert copyRejected
@@ -9624,7 +9624,7 @@ if "--regression-test" in commandLineParams():
     let compiled = compileTest(g)
     var state = cloneInts(input)
     var scratch = newEvalScratch(g.len)
-    let limit = min(32768, max(2100, input.len * 32))
+    let limit = min(32768, max(1500, input.len * 32))
     let nRounds = min(rounds, max(1, int(ceil(2 * sqrt(float(input.len))))))
     var attPairs: seq[(float, float)] = @[]
     var prev = 0.0
@@ -9798,10 +9798,10 @@ if "--regression-test" in commandLineParams():
   var longChain: Genome = @[]
   for i in 0 ..< 1499:
     longChain.add(testRule(@[2000 + i], @[2001 + i], 1.0))
-  longChain.add(testRule(@[2000 + 1499], @[2000 + 2100], 1.0))
-  doAssert longChain.len == 2100
-  doAssert actualRaw(longChain, @[2000], 1) == 2100.0
-  echo "PASS: 2100 ordered matches without recursive state expansion"
+  longChain.add(testRule(@[2000 + 1499], @[2000 + 1500], 1.0))
+  doAssert longChain.len == 1500
+  doAssert actualRaw(longChain, @[2000], 1) == 1500.0
+  echo "PASS: 1500 ordered matches without recursive state expansion"
   # Force sparse sorted candidate iteration, a miss stretch, then state mutation
   # followed by a NEW candidate scan. The later pattern was absent initially.
   var sparseGenome: Genome = @[]
@@ -9967,12 +9967,12 @@ if "--regression-test" in commandLineParams():
   many.add(testRule(@[122], @[121], 1.0))
   let index = buildCandidateIndex(compileTest(many))
   var scratch = newEvalScratch(many.len)
-  let repeated = repeat(97, 2100)
+  let repeated = repeat(97, 1500)
   let began = cpuTime()
   for i in 0 ..< 1000:
     scanCandidateIds(index, repeated, scratch.candidateIds, scratch.candidateScratch)
     doAssert scratch.candidateIds.len == 400
-  echo "candidate scan 1000 x 2100 repeated bytes CPU seconds: ", cpuTime() - began
+  echo "candidate scan 1000 x 1500 repeated bytes CPU seconds: ", cpuTime() - began
   scratch.candidateScratch.stamp = high(int32)
   scanCandidateIds(index, repeated, scratch.candidateIds, scratch.candidateScratch)
   doAssert scratch.candidateScratch.stamp == 1 and scratch.candidateIds.len == 400
@@ -10406,7 +10406,7 @@ if "--self-test" in commandLineParams():
   doAssert indices.len == 18 and indices[0] == 0 and indices[^1] == RETAINED_SAMPLES_PER_CASE-1
   for i in 1 ..< indices.len: doAssert indices[i] > indices[i - 1]
   echo "PASS: equal rolling-case objective weights and full-range trajectory sampling"
-  doAssert AAA == 2100
+  doAssert AAA == 1500
   let syntheticScores = @[0.800, 0.798, 0.700, 0.795]
   let syntheticTimes = @[10.0, 1.0, 0.5, 5.0]
   let pareto = looseRuntimeParetoPool(@[0, 1, 2, 3],
@@ -10440,7 +10440,7 @@ if "--self-test" in commandLineParams():
   except EvaluationBudgetExceeded:
     caughtVisitBudget = true
   doAssert caughtVisitBudget
-  echo "PASS: AAA=2100, loose Pareto champion preservation and independent time/work budget guards"
+  echo "PASS: AAA=1500, loose Pareto champion preservation and independent time/work budget guards"
   quit(0)
 
 setMaxPoolSize(workerCount)
@@ -10916,7 +10916,7 @@ for iter in startIter ..< TARGET_GENERATIONS:
       compiledPatternRevision[jp][i] = rev
 
     # .aが1つも変わっていなければcandidate indexも完全に再利用できる。
-    # これもelite系統で毎世代の2100-rule走査を丸ごと省略する。
+    # これもelite系統で毎世代の1500-rule走査を丸ごと省略する。
     if patternChanged:
       inc candidateIndexRebuilds
       rebuildCandidateIndex(candidatePopulation[jp], compiledPopulation[jp])
@@ -12215,7 +12215,7 @@ for iter in startIter ..< TARGET_GENERATIONS:
     let maxAttempts = max(32, injectTarget * 8)
 
     # ★変更: 以前はここで候補ごとに survivorIds / 既注入分との
-    # 全genome(AAA=2100行)比較を sameRule で逐一行っており、
+    # 全genome(AAA=1500行)比較を sameRule で逐一行っており、
     # 世代あたり最大 maxAttempts×(survivorIds数+injectTarget)×AAA 回の
     # rule比較が発生していた(hidden bottleneck)。
     # survivorIdsのfingerprintは候補を引く前に1回だけ計算しておき、
