@@ -2270,9 +2270,9 @@ const NGRAM_SCAN_BYTE_BUDGET = 256_000  # 集計コストを抑えるための�
 # Spearman has 20 observations; this keeps the total evaluation set at 120
 # points while avoiding the very noisy tiny trajectories that arise when the
 # same budget is fragmented too aggressively.
-const CASES_PER_TIMESCALE = 2
+const CASES_PER_TIMESCALE = 1
 const MULTI_CASE_COUNT = 3 * CASES_PER_TIMESCALE
-const RETAINED_SAMPLES_PER_CASE = 20
+const RETAINED_SAMPLES_PER_CASE = 40
 const FAST_ROLLING_SLOT = 0
 const MEDIUM_ROLLING_SLOT = 1
 const SLOW_ROLLING_SLOT = 2
@@ -2599,8 +2599,8 @@ var eliteOfElites: seq[EliteArchiveEntry] = @[]
 const JEV_BRIDGE_PROTOCOL = 1
 const JEV_MAX_MODELS = 64
 const JEV_DEFAULT_MODELS = 64
-const JEV_GENERATION_INTERVAL = 20
-const JEV_STEPS = 6400
+const JEV_GENERATION_INTERVAL = 25
+const JEV_STEPS = 4500
 const JEV_SUFFIX_LENGTH = 64
 # Inner TEXT GA, independent for each outer Genome. Evaluations include the
 # initial population and every offspring; reusing an elite costs no evaluation.
@@ -2616,7 +2616,7 @@ static:
   doAssert JEV_INNER_CROSSOVER_PERCENT in 0..100
   doAssert JEV_INNER_IMMIGRANT_PERCENT in 0..100
 const JEV_SURVIVOR_SLOTS = 8
-const JEV_MA_WINDOW = 10
+const JEV_MA_WINDOW = 8
 
 const JEV_HALL_CAPACITY = 64
 const JEV_HALL_INJECT_SLOTS = 4
@@ -5564,9 +5564,9 @@ const ARCHIVE_MAX_ENTRIES = 2048
 # that are going to be rejected anyway.  v31 never falls back to the old
 # stride=2 (11 points/case) unless explicitly changed here; stride 3 already
 # gives about eight points on a 20-point trajectory and is materially cheaper.
-const FAST_EVAL_STRIDE = 4
-const FAST_EVAL_STRIDE_MIN = 3
-const FAST_EVAL_STRIDE_MAX = 5
+const FAST_EVAL_STRIDE = 8
+const FAST_EVAL_STRIDE_MIN = 4
+const FAST_EVAL_STRIDE_MAX = 10
 var adaptiveFastEvalStride = FAST_EVAL_STRIDE
 # FAST must not let computationally bloated offspring dominate generation time.
 # FULL keeps the original unlimited scan-work semantics. The FAST cap is a
@@ -8300,7 +8300,7 @@ if "--bottleneck-test" in commandLineParams():
         result[i] = transplantRule(donor[i], donor[0].embedding, base[0].embedding)
     result[0].embedding = base[0].embedding
     for i in 1 ..< result.len: result[i].embedding = @[]
-  
+
   proc crossoverGenomeReference(
     p1, p2: Genome, op: CrossoverOp,
     t1, t2: RuleTrace
@@ -8430,19 +8430,19 @@ if "--bottleneck-test" in commandLineParams():
       scratch.byteSeen.fill(0)
       scratch.stamp = 0
     inc scratch.stamp
-  
+
     for pid in index.alwaysCandidates:
       markCandidate(pid.int, minRuleIndex, outIds, scratch)
-  
+
     if outIds.len >= index.candidateRuleCount - minRuleIndex:
       scratch.candidateValid = true
       return
-  
+
     let n = text.len
     if n == 0:
       scratch.candidateValid = true
       return
-  
+
     var i = 0
     var prev = text[0]
     while true:
@@ -8460,11 +8460,11 @@ if "--bottleneck-test" in commandLineParams():
             scratch.candidateValid = true
             return
           p = index.next1[pid]
-  
+
       inc i
       if i >= n:
         break
-  
+
       let curr = text[i]
       if prev >= 0 and prev <= EMBEDDING_OOV and curr >= 0 and curr <= EMBEDDING_OOV:
         let key = pairKey(prev, curr)
@@ -8488,11 +8488,11 @@ if "--bottleneck-test" in commandLineParams():
               scratch.candidateValid = true
               return
             q = index.next2[pid]
-  
+
       prev = curr
-  
+
     scratch.candidateValid = true
-  
+
   proc scoreRawReference(
     genome: Genome,
     compiled: seq[SeqPattern],
@@ -8648,7 +8648,7 @@ if "--bottleneck-test" in commandLineParams():
       # Critical fixed-point cutoff: zero successful replacements in a round means
       # every later round would see the identical state and can do no new work.
       if terminated or not rewrote: break
-  
+
   proc selectParentCappedReference(
     caseScores: seq[seq[float]],
     candidateIds: openArray[int],
